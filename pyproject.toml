@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "polymarket-baseline"
+version = "0.1.0"
+description = "Baseline Polymarket metadata and price-history pipeline"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "matplotlib>=3.8",
+  "numpy>=1.26",
+  "pandas>=2.1",
+  "pyarrow>=14.0",
+  "requests>=2.31",
+  "scikit-learn>=1.4",
+]
+
+[project.scripts]
+polymarket-pipeline = "polymarket_pipeline.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["polymarket_pipeline*"]
