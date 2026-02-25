@@ -182,22 +182,39 @@ class PolymarketClients:
         offset: int,
         active: bool = True,
         closed: bool = False,
-        order: str = "volume_24hr",
+        order: str | None = "volume24hr",
         cache_dir: Path | None = None,
         cache_ttl_s: int | None = None,
     ) -> list[dict[str, Any]]:
-        payload = self.gamma.get_json(
-            "/events",
-            params={
-                "active": str(active).lower(),
-                "closed": str(closed).lower(),
-                "limit": limit,
-                "offset": offset,
-                "order": order,
-            },
-            cache_dir=cache_dir,
-            cache_ttl_s=cache_ttl_s,
-        )
+        params: dict[str, Any] = {
+            "active": str(active).lower(),
+            "closed": str(closed).lower(),
+            "limit": int(limit),
+            "offset": int(offset),
+        }
+        if order:
+            params["order"] = order
+
+        try:
+            payload = self.gamma.get_json(
+                "/events",
+                params=params,
+                cache_dir=cache_dir,
+                cache_ttl_s=cache_ttl_s,
+            )
+        except requests.HTTPError as exc:
+            status = exc.response.status_code if exc.response is not None else None
+            if status == 422 and order:
+                LOGGER.warning("Gamma rejected /events order=%s; retrying without order", order)
+                params.pop("order", None)
+                payload = self.gamma.get_json(
+                    "/events",
+                    params=params,
+                    cache_dir=cache_dir,
+                    cache_ttl_s=cache_ttl_s,
+                )
+            else:
+                raise
         if isinstance(payload, list):
             return payload
         if isinstance(payload, dict):

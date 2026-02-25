@@ -112,7 +112,7 @@ class PipelineRunner:
                 offset=offset,
                 active=True,
                 closed=False,
-                order="volume_24hr",
+                order="volume24hr",
                 cache_dir=self.config.cache_dir / "gamma_events",
                 cache_ttl_s=self.config.gamma_cache_ttl_s,
             )
