@@ -1,0 +1,14 @@
+.git
+.gitignore
+.venv
+.idea
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+*.egg-info
+.pytest_cache
+data
+data_smoke
+openspec
+.codex

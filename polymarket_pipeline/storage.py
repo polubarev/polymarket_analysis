@@ -29,6 +29,9 @@ def upsert_parquet(
     sort_keys: list[str] | None = None,
 ) -> pd.DataFrame:
     path.parent.mkdir(parents=True, exist_ok=True)
+    if new_df.empty and path.exists():
+        return pd.read_parquet(path)
+
     if path.exists():
         existing = pd.read_parquet(path)
         combined = pd.concat([existing, new_df], ignore_index=True)

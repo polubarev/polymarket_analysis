@@ -65,6 +65,68 @@ def _first(value_map: dict[str, Any], keys: tuple[str, ...]) -> Any:
     return None
 
 
+def _parse_list_field(value: Any) -> list[Any]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    if isinstance(value, tuple):
+        return list(value)
+    if not isinstance(value, str):
+        return []
+
+    stripped = value.strip()
+    if not stripped:
+        return []
+    try:
+        parsed = json.loads(stripped)
+    except (json.JSONDecodeError, TypeError):
+        parts = [part.strip().strip('"').strip("'") for part in stripped.split(",")]
+        return [part for part in parts if part]
+
+    if isinstance(parsed, list):
+        return parsed
+    if parsed in (None, ""):
+        return []
+    return [parsed]
+
+
+def _extract_market_tokens(market: dict[str, Any]) -> list[dict[str, str | None]]:
+    extracted: list[dict[str, str | None]] = []
+
+    tokens = _first(market, ("tokens",))
+    if isinstance(tokens, list):
+        for token in tokens:
+            if not isinstance(token, dict):
+                continue
+            asset_id = _first(token, ("token_id", "tokenId", "asset_id", "assetId", "id"))
+            if asset_id in (None, ""):
+                continue
+            outcome = _first(token, ("outcome", "name", "title"))
+            extracted.append(
+                {
+                    "asset_id": str(asset_id),
+                    "outcome": str(outcome) if outcome not in (None, "") else None,
+                }
+            )
+    if extracted:
+        return extracted
+
+    outcomes = _parse_list_field(_first(market, ("outcomes", "outcomeNames", "answers")))
+    clob_token_ids = _parse_list_field(_first(market, ("clobTokenIds", "clob_token_ids")))
+    for idx, asset_id in enumerate(clob_token_ids):
+        if asset_id in (None, ""):
+            continue
+        outcome = outcomes[idx] if idx < len(outcomes) else None
+        extracted.append(
+            {
+                "asset_id": str(asset_id),
+                "outcome": str(outcome) if outcome not in (None, "") else None,
+            }
+        )
+    return extracted
+
+
 def extract_tables(events: list[dict[str, Any]]) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     event_cols = ["event_id", "slug", "title", "start_ts", "end_ts", "tags"]
     market_cols = [
@@ -112,12 +174,14 @@ def extract_tables(events: list[dict[str, Any]]) -> tuple[pd.DataFrame, pd.DataF
             question = _first(market, ("question", "title", "name"))
             active = _coerce_bool(_first(market, ("active",)))
             closed = _coerce_bool(_first(market, ("closed", "isClosed")))
-            tokens = _first(market, ("tokens",)) or []
+            token_pairs = _extract_market_tokens(market)
+            outcome_values = _parse_list_field(_first(market, ("outcomes", "outcomeNames", "answers")))
             market_type = _first(market, ("marketType", "type"))
             if market_type is None:
-                if isinstance(tokens, list) and len(tokens) == 2:
+                token_count = len(token_pairs) if token_pairs else len(outcome_values)
+                if token_count == 2:
                     market_type = "binary"
-                elif isinstance(tokens, list) and len(tokens) > 2:
+                elif token_count > 2:
                     market_type = "multi"
                 else:
                     market_type = "unknown"
@@ -134,19 +198,14 @@ def extract_tables(events: list[dict[str, Any]]) -> tuple[pd.DataFrame, pd.DataF
                 }
             )
 
-            if not isinstance(tokens, list):
-                continue
-            for token in tokens:
-                if not isinstance(token, dict):
-                    continue
-                asset_id = _first(token, ("token_id", "tokenId", "asset_id", "assetId", "id"))
-                outcome = _first(token, ("outcome", "name", "title"))
-                if asset_id is None:
+            for token in token_pairs:
+                asset_id = token["asset_id"]
+                if asset_id in (None, ""):
                     continue
                 token_rows.append(
                     {
                         "market_id": str(market_id) if market_id is not None else None,
-                        "outcome": str(outcome) if outcome is not None else None,
+                        "outcome": token["outcome"],
                         "asset_id": str(asset_id),
                     }
                 )

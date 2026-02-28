@@ -82,8 +82,13 @@ def compute_asset_features(
         base = series[series.index >= start]
         if len(base) < 3:
             continue
+        observed_start = base.index.min()
 
-        grid = pd.date_range(start=start, end=end, freq=freq, tz="UTC")
+        # Normalize irregular timestamps to a fixed interval grid before filling.
+        base = base.resample(freq).last().dropna()
+        if base.empty:
+            continue
+        grid = pd.date_range(start=observed_start.floor(freq), end=end.ceil(freq), freq=freq, tz="UTC")
         aligned = base.reindex(grid)
         missing_ratio = float(aligned.isna().mean()) if len(aligned) else 1.0
         # Thin markets are common; only forward-fill short gaps and keep missingness as a feature.
@@ -207,6 +212,12 @@ def save_cluster_plots(
             descriptions[cluster_id] = "no data"
             continue
 
+        valid_columns = np.isfinite(stacked).any(axis=0)
+        if not bool(valid_columns.any()):
+            descriptions[cluster_id] = "no data"
+            continue
+        stacked = stacked[:, valid_columns]
+
         median = np.nanmedian(stacked, axis=0)
         q1 = np.nanpercentile(stacked, 25, axis=0)
         q3 = np.nanpercentile(stacked, 75, axis=0)
@@ -257,6 +268,7 @@ def build_bet_type_summary(
     tokens_df: pd.DataFrame,
     price_history_df: pd.DataFrame,
     feature_df: pd.DataFrame,
+    quality_df: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     if tokens_df.empty:
         return pd.DataFrame(
@@ -267,6 +279,12 @@ def build_bet_type_summary(
                 "tokens_with_history",
                 "coverage_pct",
                 "avg_volatility",
+                "avg_return_total",
+                "avg_slope",
+                "median_num_points",
+                "median_missing_ratio",
+                "tokens_quality_pass",
+                "quality_pass_rate",
             ]
         )
 
@@ -287,10 +305,17 @@ def build_bet_type_summary(
     has_history = set(price_history_df["asset_id"].astype(str).unique()) if not price_history_df.empty else set()
     token_tags["has_history"] = token_tags["asset_id"].isin(has_history)
     token_tags = token_tags.merge(
-        feature_df[["asset_id", "volatility"]].copy(),
+        feature_df[["asset_id", "volatility", "return_total", "slope", "num_points", "missing_ratio"]].copy(),
         on="asset_id",
         how="left",
     )
+    if quality_df is not None and not quality_df.empty:
+        quality = quality_df[["asset_id", "quality_pass"]].copy()
+        quality["asset_id"] = quality["asset_id"].astype(str)
+        token_tags = token_tags.merge(quality, on="asset_id", how="left")
+    else:
+        token_tags["quality_pass"] = False
+    token_tags["quality_pass"] = token_tags["quality_pass"].fillna(False).astype(bool)
 
     grouped = token_tags.groupby("primary_tag", dropna=False).agg(
         markets=("market_id", "nunique"),
@@ -298,11 +323,143 @@ def build_bet_type_summary(
         tokens_with_history=("has_history", "sum"),
         coverage_pct=("has_history", "mean"),
         avg_volatility=("volatility", "mean"),
+        avg_return_total=("return_total", "mean"),
+        avg_slope=("slope", "mean"),
+        median_num_points=("num_points", "median"),
+        median_missing_ratio=("missing_ratio", "median"),
+        tokens_quality_pass=("quality_pass", "sum"),
+        quality_pass_rate=("quality_pass", "mean"),
     )
     grouped = grouped.reset_index().sort_values(["tokens", "markets"], ascending=False)
     grouped["coverage_pct"] = grouped["coverage_pct"].fillna(0.0)
     grouped["avg_volatility"] = grouped["avg_volatility"].fillna(0.0)
+    grouped["avg_return_total"] = grouped["avg_return_total"].fillna(0.0)
+    grouped["avg_slope"] = grouped["avg_slope"].fillna(0.0)
+    grouped["median_num_points"] = grouped["median_num_points"].fillna(0.0)
+    grouped["median_missing_ratio"] = grouped["median_missing_ratio"].fillna(1.0)
+    grouped["quality_pass_rate"] = grouped["quality_pass_rate"].fillna(0.0)
     return grouped
+
+
+def build_market_quality_table(
+    *,
+    target_tokens_df: pd.DataFrame,
+    markets_df: pd.DataFrame,
+    price_history_df: pd.DataFrame,
+    feature_df: pd.DataFrame,
+    min_points: int,
+    max_missing_ratio: float,
+    min_price_range: float,
+    min_liquidity: float,
+) -> pd.DataFrame:
+    columns = [
+        "market_id",
+        "asset_id",
+        "liquidity",
+        "history_points_raw",
+        "has_history",
+        "num_points",
+        "missing_ratio",
+        "price_range",
+        "volatility",
+        "return_total",
+        "slope",
+        "check_min_points",
+        "check_missing_ratio",
+        "check_price_range",
+        "check_liquidity",
+        "quality_pass",
+    ]
+    if target_tokens_df.empty:
+        return pd.DataFrame(columns=columns)
+
+    quality = target_tokens_df[["market_id", "asset_id"]].drop_duplicates().copy()
+    quality["asset_id"] = quality["asset_id"].astype(str)
+
+    history_counts = (
+        price_history_df.groupby("asset_id", dropna=False)["ts"].count().rename("history_points_raw")
+        if not price_history_df.empty
+        else pd.Series(dtype=int, name="history_points_raw")
+    )
+    if not history_counts.empty:
+        history_counts.index = history_counts.index.astype(str)
+        quality = quality.merge(history_counts.to_frame(), left_on="asset_id", right_index=True, how="left")
+    else:
+        quality["history_points_raw"] = 0
+
+    feature_work = feature_df[
+        ["asset_id", "num_points", "missing_ratio", "max_price", "min_price", "volatility", "return_total", "slope"]
+    ].copy()
+    if not feature_work.empty:
+        feature_work["asset_id"] = feature_work["asset_id"].astype(str)
+    quality = quality.merge(feature_work, on="asset_id", how="left")
+
+    quality = quality.merge(markets_df[["market_id", "liquidity"]], on="market_id", how="left")
+    quality["liquidity"] = pd.to_numeric(quality["liquidity"], errors="coerce")
+    quality["history_points_raw"] = pd.to_numeric(quality["history_points_raw"], errors="coerce").fillna(0).astype(int)
+    quality["has_history"] = quality["history_points_raw"] > 0
+    quality["price_range"] = (quality["max_price"] - quality["min_price"]).fillna(0.0)
+
+    quality["check_min_points"] = quality["history_points_raw"].fillna(0) >= float(min_points)
+    quality["check_missing_ratio"] = quality["missing_ratio"].fillna(1.0) <= float(max_missing_ratio)
+    quality["check_price_range"] = quality["price_range"].fillna(0.0) >= float(min_price_range)
+
+    if float(min_liquidity) > 0.0:
+        quality["check_liquidity"] = quality["liquidity"].fillna(-np.inf) >= float(min_liquidity)
+    else:
+        quality["check_liquidity"] = True
+
+    quality["quality_pass"] = (
+        quality["has_history"]
+        & quality["check_min_points"]
+        & quality["check_missing_ratio"]
+        & quality["check_price_range"]
+        & quality["check_liquidity"]
+    )
+
+    for col in ("missing_ratio", "volatility", "return_total", "slope"):
+        quality[col] = pd.to_numeric(quality[col], errors="coerce")
+    quality["num_points"] = pd.to_numeric(quality["num_points"], errors="coerce")
+    return quality[columns]
+
+
+def build_tag_rankings(bet_type_summary_df: pd.DataFrame, *, top_n: int = 10) -> dict[str, list[dict[str, Any]]]:
+    if bet_type_summary_df.empty:
+        return {
+            "highest_volatility_tags": [],
+            "strongest_upward_trend_tags": [],
+            "strongest_downward_trend_tags": [],
+            "lowest_coverage_tags": [],
+            "highest_quality_pass_rate_tags": [],
+        }
+
+    n = max(1, int(top_n))
+    summary = bet_type_summary_df.copy()
+    summary = summary[summary["tokens"] >= 5]
+    if summary.empty:
+        summary = bet_type_summary_df.copy()
+
+    base_cols = ["primary_tag", "tokens", "coverage_pct", "quality_pass_rate", "avg_volatility", "avg_slope"]
+
+    return {
+        "highest_volatility_tags": summary.sort_values("avg_volatility", ascending=False)
+        .head(n)[base_cols]
+        .to_dict(orient="records"),
+        "strongest_upward_trend_tags": summary.sort_values("avg_slope", ascending=False)
+        .head(n)[base_cols]
+        .to_dict(orient="records"),
+        "strongest_downward_trend_tags": summary.sort_values("avg_slope", ascending=True)
+        .head(n)[base_cols]
+        .to_dict(orient="records"),
+        "lowest_coverage_tags": summary.sort_values("coverage_pct", ascending=True)
+        .head(n)[base_cols]
+        .to_dict(orient="records"),
+        "highest_quality_pass_rate_tags": summary.sort_values(
+            ["quality_pass_rate", "tokens"], ascending=[False, False]
+        )
+        .head(n)[base_cols]
+        .to_dict(orient="records"),
+    }
 
 
 def build_report_payload(
@@ -313,10 +470,13 @@ def build_report_payload(
     target_tokens_df: pd.DataFrame,
     price_history_df: pd.DataFrame,
     feature_df: pd.DataFrame,
+    quality_df: pd.DataFrame,
     clustered_df: pd.DataFrame,
     silhouette: float | None,
     bet_type_summary_df: pd.DataFrame,
     cluster_descriptions: dict[int, str],
+    cluster_input_assets: int,
+    tag_rank_top_n: int = 10,
 ) -> dict[str, Any]:
     targeted_assets = target_tokens_df["asset_id"].astype(str).nunique() if not target_tokens_df.empty else 0
     targeted_set = set(target_tokens_df["asset_id"].astype(str).unique()) if not target_tokens_df.empty else set()
@@ -335,6 +495,25 @@ def build_report_payload(
         if not target_counts.empty:
             median_points = float(target_counts.median())
 
+    quality_total = len(quality_df) if quality_df is not None else 0
+    quality_pass_count = 0
+    quality_failures: dict[str, int] = {
+        "failed_min_points": 0,
+        "failed_missing_ratio": 0,
+        "failed_price_range": 0,
+        "failed_liquidity": 0,
+    }
+    if quality_df is not None and not quality_df.empty and "quality_pass" in quality_df.columns:
+        quality_pass_count = int(quality_df["quality_pass"].fillna(False).astype(bool).sum())
+        for metric, col in (
+            ("failed_min_points", "check_min_points"),
+            ("failed_missing_ratio", "check_missing_ratio"),
+            ("failed_price_range", "check_price_range"),
+            ("failed_liquidity", "check_liquidity"),
+        ):
+            if col in quality_df.columns:
+                quality_failures[metric] = int((~quality_df[col].fillna(False).astype(bool)).sum())
+
     cluster_sizes: list[dict[str, Any]] = []
     tag_distribution: list[dict[str, Any]] = []
     if not clustered_df.empty:
@@ -351,6 +530,7 @@ def build_report_payload(
             tag_distribution = tag_df.to_dict(orient="records")
 
     by_tag_records = bet_type_summary_df.to_dict(orient="records") if not bet_type_summary_df.empty else []
+    tag_rankings = build_tag_rankings(bet_type_summary_df, top_n=tag_rank_top_n)
 
     return {
         "coverage": {
@@ -362,9 +542,17 @@ def build_report_payload(
             "pct_targeted_with_history": float(tokens_with_history / targeted_assets) if targeted_assets else 0.0,
             "median_points_per_token": median_points,
         },
+        "quality": {
+            "quality_total_assets": int(quality_total),
+            "quality_pass_assets": int(quality_pass_count),
+            "quality_pass_rate": float(quality_pass_count / quality_total) if quality_total else 0.0,
+            "failure_counts": quality_failures,
+        },
         "by_bet_type": by_tag_records,
+        "tag_rankings": tag_rankings,
         "clusters": {
             "num_clusters": int(clustered_df["cluster_id"].nunique()) if not clustered_df.empty else 0,
+            "cluster_input_assets": int(cluster_input_assets),
             "silhouette_score": silhouette,
             "cluster_sizes": cluster_sizes,
             "cluster_descriptions": [

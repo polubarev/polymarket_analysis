@@ -25,6 +25,17 @@ class PipelineConfig:
     cluster_k: int = 8
     gap_fill_limit: int = 6
     random_seed: int = 42
+    quality_min_points: int = 24
+    quality_max_missing_ratio: float = 0.8
+    quality_min_price_range: float = 0.02
+    quality_min_liquidity: float = 0.0
+    tag_rank_top_n: int = 10
+    price_fetch_workers: int = 16
+    incremental_prices: bool = True
+    incremental_mode: str = "tail"
+    incremental_overlap_points: int = 2
+    write_raw_price_files: bool = True
+    http_pool_maxsize: int = 64
 
     @property
     def raw_dir(self) -> Path:

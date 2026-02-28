@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import logging
 import time
 from dataclasses import asdict
@@ -12,6 +13,7 @@ import pandas as pd
 from .analysis import (
     FEATURE_COLUMNS,
     build_bet_type_summary,
+    build_market_quality_table,
     build_report_payload,
     cluster_features,
     compute_asset_features,
@@ -30,7 +32,12 @@ LOGGER = logging.getLogger(__name__)
 class PipelineRunner:
     def __init__(self, config: PipelineConfig) -> None:
         self.config = config
-        self.metrics: dict[str, int] = {"requests": 0, "retries": 0, "empty_histories": 0}
+        self.metrics: dict[str, int] = {
+            "requests": 0,
+            "retries": 0,
+            "empty_histories": 0,
+            "price_history_errors": 0,
+        }
 
     def run(self) -> dict[str, Path]:
         self.config.ensure_dirs()
@@ -45,6 +52,7 @@ class PipelineRunner:
             data_rate_limit=self.config.data_rate_limit,
             rate_window_s=self.config.rate_window_s,
             metrics=self.metrics,
+            connection_pool_maxsize=self.config.http_pool_maxsize,
         )
 
         events = self._discover_events(clients)
@@ -75,7 +83,7 @@ class PipelineRunner:
         if self.config.fetch_trades_sample > 0:
             self._fetch_trades_sample(clients, markets_df)
 
-        report_path, clusters_path = self._analyze(
+        report_path, clusters_path, quality_path = self._analyze(
             events_df=events_df,
             markets_df=markets_df,
             all_tokens_df=tokens_df,
@@ -84,10 +92,12 @@ class PipelineRunner:
         )
 
         LOGGER.info(
-            "Pipeline done. requests=%s retries=%s empty_histories=%s",
+            "Pipeline done. requests=%s retries=%s empty_histories=%s price_history_errors=%s skipped_price_assets=%s",
             self.metrics.get("requests", 0),
             self.metrics.get("retries", 0),
             self.metrics.get("empty_histories", 0),
+            self.metrics.get("price_history_errors", 0),
+            self.metrics.get("skipped_price_assets", 0),
         )
 
         return {
@@ -96,6 +106,7 @@ class PipelineRunner:
             "tokens": tokens_path,
             "price_history": self.config.output_dir / "price_history.parquet",
             "clusters": clusters_path,
+            "market_quality": quality_path,
             "report": report_path,
             "raw_events": raw_events_path,
         }
@@ -128,50 +139,151 @@ class PipelineRunner:
 
     def _ingest_price_history(self, clients: PolymarketClients, target_tokens_df: pd.DataFrame) -> pd.DataFrame:
         price_path = self.config.output_dir / "price_history.parquet"
+        output_columns = ["asset_id", "ts", "price", "interval", "ingested_at"]
         if target_tokens_df.empty:
             return upsert_parquet(
                 price_path,
-                pd.DataFrame(columns=["asset_id", "ts", "price", "interval", "ingested_at"]),
+                pd.DataFrame(columns=output_columns),
                 dedupe_keys=["asset_id", "ts", "interval"],
                 sort_keys=["asset_id", "ts"],
             )
 
         asset_ids = target_tokens_df["asset_id"].dropna().astype(str).drop_duplicates().tolist()
         now_ts = int(time.time())
-        start_ts = now_ts - self.config.window_days * 24 * 60 * 60
+        global_start_ts = now_ts - self.config.window_days * 24 * 60 * 60
+        ingested_at = int(time.time())
+
+        existing_latest_ts: dict[str, int] = {}
+        if self.config.incremental_prices and price_path.exists():
+            try:
+                existing_df = pd.read_parquet(price_path, columns=["asset_id", "interval", "ts"])
+            except Exception:
+                existing_df = pd.read_parquet(price_path)
+            if not existing_df.empty and "asset_id" in existing_df.columns:
+                existing_df["asset_id"] = existing_df["asset_id"].astype(str)
+                if "interval" in existing_df.columns:
+                    interval_mask = existing_df["interval"].fillna("").astype(str) == str(self.config.interval)
+                    existing_df = existing_df.loc[interval_mask].copy()
+                if not existing_df.empty and "ts" in existing_df.columns:
+                    existing_df["ts"] = pd.to_numeric(existing_df["ts"], errors="coerce")
+                    existing_df = existing_df.dropna(subset=["ts"])
+                    if not existing_df.empty:
+                        existing_df["ts"] = existing_df["ts"].astype("int64")
+                        existing_latest_ts = (
+                            existing_df.groupby("asset_id", as_index=True)["ts"].max().astype(int).to_dict()
+                        )
+
+        incremental_mode = str(self.config.incremental_mode).strip().lower()
+        if incremental_mode not in {"tail", "skip"}:
+            incremental_mode = "tail"
+
+        fetch_plan: list[tuple[str, int]] = []
+        if not self.config.incremental_prices:
+            fetch_plan = [(asset_id, global_start_ts) for asset_id in asset_ids]
+            self.metrics["skipped_price_assets"] = 0
+            LOGGER.info("Incremental disabled; fetching prices-history for %s assets", len(fetch_plan))
+        elif incremental_mode == "skip":
+            fetch_plan = [
+                (asset_id, global_start_ts)
+                for asset_id in asset_ids
+                if asset_id not in existing_latest_ts
+            ]
+            skipped_assets = len(asset_ids) - len(fetch_plan)
+            self.metrics["skipped_price_assets"] = skipped_assets
+            if skipped_assets > 0:
+                LOGGER.info(
+                    "Skipping %s assets with existing %s interval history; fetching %s assets",
+                    skipped_assets,
+                    self.config.interval,
+                    len(fetch_plan),
+                )
+            else:
+                LOGGER.info("Fetching prices-history for %s assets", len(fetch_plan))
+        else:
+            interval_s = self._interval_to_seconds(self.config.interval) or 3600
+            overlap_points = max(0, int(self.config.incremental_overlap_points))
+            overlap_s = overlap_points * interval_s
+            existing_count = 0
+            for asset_id in asset_ids:
+                latest_ts = existing_latest_ts.get(asset_id)
+                if latest_ts is None:
+                    fetch_plan.append((asset_id, global_start_ts))
+                else:
+                    existing_count += 1
+                    fetch_plan.append((asset_id, max(global_start_ts, int(latest_ts) - overlap_s)))
+            self.metrics["skipped_price_assets"] = 0
+            LOGGER.info(
+                "Tail refresh for %s assets (%s existing, %s new), overlap_points=%s",
+                len(fetch_plan),
+                existing_count,
+                len(fetch_plan) - existing_count,
+                overlap_points,
+            )
+
+        if not fetch_plan:
+            return upsert_parquet(
+                price_path,
+                pd.DataFrame(columns=output_columns),
+                dedupe_keys=["asset_id", "ts", "interval"],
+                sort_keys=["asset_id", "ts"],
+            )
 
         all_rows: list[dict[str, Any]] = []
-        ingested_at = int(time.time())
-        LOGGER.info("Fetching prices-history for %s assets", len(asset_ids))
 
-        for idx, asset_id in enumerate(asset_ids, start=1):
-            # CLOB /prices-history expects outcome asset_id (not condition_id).
-            history = clients.fetch_prices_history(
-                asset_id=asset_id,
-                interval=self.config.interval,
-                start_ts=start_ts,
-                end_ts=now_ts,
-            )
-            rows = self._normalize_history_rows(
-                asset_id,
-                history,
-                interval=self.config.interval,
-                ingested_at=ingested_at,
-            )
-            if not rows:
-                self.metrics["empty_histories"] = self.metrics.get("empty_histories", 0) + 1
-            all_rows.extend(rows)
+        def fetch_one(asset_id: str, start_ts: int) -> tuple[str, list[dict[str, Any]], str | None]:
+            try:
+                history = clients.fetch_prices_history(
+                    asset_id=asset_id,
+                    interval=self.config.interval,
+                    start_ts=start_ts,
+                    end_ts=now_ts,
+                )
+                rows = self._normalize_history_rows(
+                    asset_id,
+                    history,
+                    interval=self.config.interval,
+                    ingested_at=ingested_at,
+                )
+                return asset_id, rows, None
+            except Exception as exc:
+                return asset_id, [], str(exc)
 
-            raw_df = pd.DataFrame(rows, columns=["asset_id", "ts", "price", "interval", "ingested_at"])
-            raw_path = self.config.raw_prices_dir / f"{asset_id}.parquet"
-            raw_df.to_parquet(raw_path, index=False)
+        worker_count = max(1, int(self.config.price_fetch_workers))
+        completed = 0
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            future_map = {
+                executor.submit(fetch_one, asset_id, fetch_start_ts): asset_id
+                for asset_id, fetch_start_ts in fetch_plan
+            }
+            for future in as_completed(future_map):
+                asset_id = future_map[future]
+                try:
+                    _, rows, error = future.result()
+                except Exception as exc:
+                    rows = []
+                    error = str(exc)
 
-            if idx % 100 == 0 or idx == len(asset_ids):
-                LOGGER.info("Price histories fetched: %s / %s", idx, len(asset_ids))
+                if error is not None:
+                    self.metrics["price_history_errors"] = self.metrics.get("price_history_errors", 0) + 1
+                    error_count = self.metrics["price_history_errors"]
+                    if error_count <= 20 or error_count % 500 == 0:
+                        LOGGER.warning("prices-history failed for asset %s: %s", asset_id, error)
 
-        new_df = pd.DataFrame(all_rows)
-        if new_df.empty:
-            new_df = pd.DataFrame(columns=["asset_id", "ts", "price", "interval", "ingested_at"])
+                if not rows:
+                    self.metrics["empty_histories"] = self.metrics.get("empty_histories", 0) + 1
+                else:
+                    all_rows.extend(rows)
+                    if self.config.write_raw_price_files:
+                        raw_df = pd.DataFrame(rows, columns=output_columns)
+                        raw_path = self.config.raw_prices_dir / f"{asset_id}.parquet"
+                        raw_df.to_parquet(raw_path, index=False)
+
+                completed += 1
+                if completed % 100 == 0 or completed == len(fetch_plan):
+                    LOGGER.info("Price histories fetched: %s / %s", completed, len(fetch_plan))
+
+        new_df = pd.DataFrame(all_rows, columns=output_columns)
+        self._log_history_cadence_sanity(new_df)
 
         return upsert_parquet(
             price_path,
@@ -179,6 +291,52 @@ class PipelineRunner:
             dedupe_keys=["asset_id", "ts", "interval"],
             sort_keys=["asset_id", "ts"],
         )
+
+    @staticmethod
+    def _interval_to_seconds(interval: str) -> int | None:
+        mapping = {
+            "1m": 60,
+            "5m": 300,
+            "15m": 900,
+            "1h": 3600,
+            "4h": 14_400,
+            "6h": 21_600,
+            "1d": 86_400,
+            "1w": 604_800,
+        }
+        return mapping.get(str(interval).strip().lower())
+
+    def _log_history_cadence_sanity(self, history_df: pd.DataFrame) -> None:
+        if history_df.empty:
+            return
+
+        expected_interval_s = self._interval_to_seconds(self.config.interval)
+        if expected_interval_s is None:
+            return
+
+        cadence = (
+            history_df.groupby("asset_id", dropna=False)["ts"]
+            .agg(min_ts="min", max_ts="max", points="count")
+            .reset_index(drop=True)
+        )
+        cadence = cadence[cadence["points"] >= 12].copy()
+        if cadence.empty:
+            return
+
+        denom = (cadence["points"] - 1).clip(lower=1)
+        cadence["step_s"] = (cadence["max_ts"] - cadence["min_ts"]) / denom
+        cadence = cadence[cadence["step_s"] > 0]
+        if cadence.empty:
+            return
+
+        median_step_s = float(cadence["step_s"].median())
+        if median_step_s < (expected_interval_s * 0.5):
+            LOGGER.warning(
+                "Observed history cadence looks faster than requested interval: requested=%s (~%ss) median_observed_step=%.1fs",
+                self.config.interval,
+                expected_interval_s,
+                median_step_s,
+            )
 
     @staticmethod
     def _normalize_history_rows(
@@ -244,7 +402,7 @@ class PipelineRunner:
         all_tokens_df: pd.DataFrame,
         target_tokens_df: pd.DataFrame,
         price_history_df: pd.DataFrame,
-    ) -> tuple[Path, Path]:
+    ) -> tuple[Path, Path, Path]:
         LOGGER.info("Running feature extraction and clustering...")
         features_df, curves = compute_asset_features(
             price_history_df,
@@ -275,8 +433,39 @@ class PipelineRunner:
         )
         feature_market_df["primary_tag"] = feature_market_df["primary_tag"].fillna("unknown")
 
+        quality_df = build_market_quality_table(
+            target_tokens_df=target_tokens_df,
+            markets_df=markets_df,
+            price_history_df=price_history_df,
+            feature_df=features_df,
+            min_points=self.config.quality_min_points,
+            max_missing_ratio=self.config.quality_max_missing_ratio,
+            min_price_range=self.config.quality_min_price_range,
+            min_liquidity=self.config.quality_min_liquidity,
+        )
+        quality_path = self.config.output_dir / "market_quality.parquet"
+        quality_df.to_parquet(quality_path, index=False)
+
+        cluster_input_df = feature_market_df.merge(
+            quality_df[["asset_id", "quality_pass"]].drop_duplicates(),
+            on="asset_id",
+            how="left",
+        )
+        cluster_input_df["quality_pass"] = cluster_input_df["quality_pass"].fillna(False).astype(bool)
+        quality_cluster_input_df = cluster_input_df[cluster_input_df["quality_pass"]].copy()
+        if len(quality_cluster_input_df) >= 3:
+            cluster_base_df = quality_cluster_input_df[["asset_id", "market_id", "primary_tag", *FEATURE_COLUMNS]]
+            LOGGER.info("Clustering with quality filter: %s assets", len(cluster_base_df))
+        else:
+            cluster_base_df = cluster_input_df[["asset_id", "market_id", "primary_tag", *FEATURE_COLUMNS]]
+            LOGGER.info(
+                "Quality filter left too few assets (%s). Falling back to all feature assets (%s).",
+                len(quality_cluster_input_df),
+                len(cluster_base_df),
+            )
+
         clustered_df, silhouette = cluster_features(
-            feature_market_df[["asset_id", "market_id", "primary_tag", *FEATURE_COLUMNS]],
+            cluster_base_df,
             cluster_k=self.config.cluster_k,
             random_seed=self.config.random_seed,
         )
@@ -295,6 +484,7 @@ class PipelineRunner:
             tokens_df=target_tokens_df,
             price_history_df=price_history_df,
             feature_df=features_df,
+            quality_df=quality_df,
         )
         save_bet_type_plot(bet_type_summary_df, analysis_dir=self.config.analysis_dir)
 
@@ -305,16 +495,19 @@ class PipelineRunner:
             target_tokens_df=target_tokens_df,
             price_history_df=price_history_df,
             feature_df=features_df,
+            quality_df=quality_df,
             clustered_df=clustered_df,
             silhouette=silhouette,
             bet_type_summary_df=bet_type_summary_df,
             cluster_descriptions=cluster_descriptions,
+            cluster_input_assets=len(cluster_base_df),
+            tag_rank_top_n=self.config.tag_rank_top_n,
         )
         report["generated_at_utc"] = datetime.now(timezone.utc).isoformat()
         report["config"] = self._serializable_config()
         report_path = self.config.analysis_dir / "report.json"
         write_report_json(report, report_path)
-        return report_path, clusters_path
+        return report_path, clusters_path, quality_path
 
     def _serializable_config(self) -> dict[str, Any]:
         payload = asdict(self.config)
