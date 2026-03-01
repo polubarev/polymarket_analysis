@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 
@@ -36,6 +36,57 @@ class PipelineConfig:
     incremental_overlap_points: int = 2
     write_raw_price_files: bool = True
     http_pool_maxsize: int = 64
+
+    # Task 1: Resolutions
+    include_resolved: bool = False
+    resolved_lookback_days: int = 365
+
+    # Task 2: Order Book
+    snapshot_orderbook: bool = False
+    orderbook_workers: int = 8
+
+    # Task 3: Volume
+    ingest_volume: bool = False
+    volume_fetch_workers: int = 8
+
+    # Task 5: Signals
+    run_signals: bool = False
+    active_signals: list[str] = field(default_factory=lambda: ["all"])
+    calibration_threshold: float = 0.15
+    spike_zscore_threshold: float = 2.5
+    convergence_days_threshold: int = 7
+    breakout_lookback_days: int = 30
+
+    # Task 6: Backtesting
+    run_backtest: bool = False
+    backtest_start_date: str | None = None
+    backtest_end_date: str | None = None
+    backtest_initial_capital: float = 10_000.0
+    backtest_spread_assumption: float = 0.03
+    backtest_max_positions: int = 50
+    backtest_stop_loss: float = 0.50
+    backtest_timeout_days: int = 90
+
+    # Task 7: Kelly sizing
+    sizing_mode: str = "flat"
+    kelly_fraction: float = 0.25
+    max_position_pct: float = 0.05
+    min_position_size: float = 1.0
+    flat_position_size: float = 100.0
+
+    # Task 8: Candidates
+    generate_candidates: bool = False
+    min_confidence: float = 0.55
+    min_edge: float = 0.05
+    max_candidates: int = 20
+
+    # Task 9: Dashboard
+    ui_mode: str = "discovery"
+
+    # Task 10: Relationships
+    detect_relationships: bool = False
+    correlation_threshold: float = 0.5
+    min_overlap_days: int = 30
 
     @property
     def raw_dir(self) -> Path:

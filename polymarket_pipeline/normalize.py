@@ -91,6 +91,62 @@ def _parse_list_field(value: Any) -> list[Any]:
     return [parsed]
 
 
+def _normalize_resolution_outcome(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip().lower()
+    if not text:
+        return None
+
+    if text in {"yes", "true", "1", "winner_yes", "resolved_yes"}:
+        return "Yes"
+    if text in {"no", "false", "0", "winner_no", "resolved_no"}:
+        return "No"
+    if text in {"invalid", "void", "voided", "cancelled", "canceled"}:
+        return "Invalid"
+    if text in {"unresolved", "pending"}:
+        return "Unresolved"
+    return None
+
+
+def _extract_market_resolution(market: dict[str, Any]) -> tuple[bool, str | None, int | None]:
+    resolved_flag = _coerce_bool(_first(market, ("resolved", "isResolved", "is_resolved")))
+    outcome_raw = _first(
+        market,
+        (
+            "winningOutcome",
+            "winning_outcome",
+            "outcome",
+            "resolutionOutcome",
+            "resolution_outcome",
+            "result",
+        ),
+    )
+    resolution_outcome = _normalize_resolution_outcome(outcome_raw)
+    resolution_ts = _to_unix_ts(
+        _first(
+            market,
+            (
+                "resolutionDate",
+                "resolvedTime",
+                "resolvedAt",
+                "resolution_ts",
+                "resolutionTs",
+                "endDate",
+            ),
+        )
+    )
+
+    if resolved_flag is None:
+        resolved_flag = resolution_outcome in {"Yes", "No", "Invalid"}
+    if resolved_flag and resolution_outcome is None:
+        resolution_outcome = "Unresolved"
+    if not resolved_flag:
+        resolution_outcome = resolution_outcome if resolution_outcome in {"Unresolved"} else None
+
+    return bool(resolved_flag), resolution_outcome, resolution_ts
+
+
 def _extract_market_tokens(market: dict[str, Any]) -> list[dict[str, str | None]]:
     extracted: list[dict[str, str | None]] = []
 
@@ -136,6 +192,9 @@ def extract_tables(events: list[dict[str, Any]]) -> tuple[pd.DataFrame, pd.DataF
         "question",
         "active",
         "closed",
+        "resolved",
+        "resolution_outcome",
+        "resolution_ts",
         "market_type",
         "liquidity",
     ]
@@ -174,6 +233,7 @@ def extract_tables(events: list[dict[str, Any]]) -> tuple[pd.DataFrame, pd.DataF
             question = _first(market, ("question", "title", "name"))
             active = _coerce_bool(_first(market, ("active",)))
             closed = _coerce_bool(_first(market, ("closed", "isClosed")))
+            resolved, resolution_outcome, resolution_ts = _extract_market_resolution(market)
             token_pairs = _extract_market_tokens(market)
             outcome_values = _parse_list_field(_first(market, ("outcomes", "outcomeNames", "answers")))
             market_type = _first(market, ("marketType", "type"))
@@ -193,6 +253,9 @@ def extract_tables(events: list[dict[str, Any]]) -> tuple[pd.DataFrame, pd.DataF
                     "question": question,
                     "active": active,
                     "closed": closed,
+                    "resolved": resolved,
+                    "resolution_outcome": resolution_outcome,
+                    "resolution_ts": resolution_ts,
                     "market_type": str(market_type).lower(),
                     "liquidity": _first(market, ("liquidity", "liquidityNum")),
                 }
@@ -222,6 +285,37 @@ def extract_tables(events: list[dict[str, Any]]) -> tuple[pd.DataFrame, pd.DataF
         tokens_df = tokens_df.drop_duplicates(subset=["market_id", "asset_id"], keep="last")
 
     return events_df, markets_df, tokens_df
+
+
+def extract_resolutions(events: list[dict[str, Any]]) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    columns = ["market_id", "condition_id", "resolution_outcome", "resolution_ts"]
+
+    for event in events:
+        markets = _first(event, ("markets",)) or []
+        if not isinstance(markets, list):
+            continue
+        for market in markets:
+            if not isinstance(market, dict):
+                continue
+            market_id = _first(market, ("id", "marketId", "market_id"))
+            condition_id = _first(market, ("conditionId", "condition_id"))
+            resolved, resolution_outcome, resolution_ts = _extract_market_resolution(market)
+            if not resolved and resolution_outcome is None and resolution_ts is None:
+                continue
+            rows.append(
+                {
+                    "market_id": str(market_id) if market_id is not None else None,
+                    "condition_id": str(condition_id) if condition_id is not None else None,
+                    "resolution_outcome": resolution_outcome,
+                    "resolution_ts": resolution_ts,
+                }
+            )
+
+    df = pd.DataFrame(rows, columns=columns)
+    if df.empty:
+        return df
+    return df.drop_duplicates(subset=["market_id"], keep="last")
 
 
 def primary_tag_from_json(tags_json: Any) -> str:

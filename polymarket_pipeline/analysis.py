@@ -28,12 +28,82 @@ FEATURE_COLUMNS = [
     "slope",
     "missing_ratio",
     "num_points",
+    "days_to_resolution",
+    "pct_lifetime_elapsed",
+    "days_since_creation",
+    "avg_spread",
+    "avg_spread_pct",
+    "spread_trend",
+    "avg_depth",
+    "avg_daily_volume",
+    "volume_trend",
+    "buy_sell_ratio",
+    "volume_price_corr",
+    "return_1d",
+    "return_7d",
+    "return_30d",
+    "zscore_7d",
+    "rsi_14",
+]
+
+FEATURE_METADATA: list[dict[str, Any]] = [
+    {"name": "p_start", "type": "price", "window": "lookback", "description": "Starting price of cleaned window"},
+    {"name": "p_end", "type": "price", "window": "lookback", "description": "Ending price of cleaned window"},
+    {"name": "max_price", "type": "price", "window": "lookback", "description": "Maximum price in window"},
+    {"name": "min_price", "type": "price", "window": "lookback", "description": "Minimum price in window"},
+    {"name": "time_of_max", "type": "price", "window": "lookback", "description": "Relative index of max price"},
+    {"name": "return_total", "type": "price", "window": "lookback", "description": "Net price change p_end-p_start"},
+    {"name": "volatility", "type": "price", "window": "lookback", "description": "Std of first differences"},
+    {"name": "max_drawdown", "type": "price", "window": "lookback", "description": "Peak-to-trough drawdown"},
+    {"name": "slope", "type": "price", "window": "lookback", "description": "Linear trend slope"},
+    {"name": "missing_ratio", "type": "price", "window": "lookback", "description": "Ratio of missing points on grid"},
+    {"name": "num_points", "type": "price", "window": "lookback", "description": "Non-missing points after fill"},
+    {"name": "days_to_resolution", "type": "time", "window": "point-in-time", "description": "Days until event end"},
+    {
+        "name": "pct_lifetime_elapsed",
+        "type": "time",
+        "window": "point-in-time",
+        "description": "Elapsed fraction between market start and end",
+    },
+    {"name": "days_since_creation", "type": "time", "window": "point-in-time", "description": "Days since market start"},
+    {"name": "avg_spread", "type": "microstructure", "window": "recent snapshots", "description": "Mean top-of-book spread"},
+    {"name": "avg_spread_pct", "type": "microstructure", "window": "recent snapshots", "description": "Mean spread / mid"},
+    {"name": "spread_trend", "type": "microstructure", "window": "recent snapshots", "description": "Slope of spread"},
+    {"name": "avg_depth", "type": "microstructure", "window": "recent snapshots", "description": "Average bid/ask depth at 5%"},
+    {"name": "avg_daily_volume", "type": "volume", "window": "lookback", "description": "Mean daily traded volume"},
+    {"name": "volume_trend", "type": "volume", "window": "lookback", "description": "Trend in daily volume"},
+    {"name": "buy_sell_ratio", "type": "volume", "window": "lookback", "description": "Total buy volume / sell volume"},
+    {
+        "name": "volume_price_corr",
+        "type": "volume",
+        "window": "lookback",
+        "description": "Correlation of daily volume with absolute daily price move",
+    },
+    {"name": "return_1d", "type": "momentum", "window": "1d", "description": "Return over last day"},
+    {"name": "return_7d", "type": "momentum", "window": "7d", "description": "Return over last seven days"},
+    {"name": "return_30d", "type": "momentum", "window": "30d", "description": "Return over last thirty days"},
+    {"name": "zscore_7d", "type": "momentum", "window": "7d", "description": "Z-score of latest price vs 7d mean/std"},
+    {"name": "rsi_14", "type": "momentum", "window": "14 periods", "description": "Wilder RSI on cleaned series"},
 ]
 
 
 def _to_pandas_freq(interval: str) -> str:
     mapping = {"1m": "1min", "5m": "5min", "15m": "15min", "1h": "1h", "4h": "4h", "1d": "1d"}
     return mapping.get(interval.lower(), interval)
+
+
+def _interval_to_seconds(interval: str) -> int:
+    mapping = {
+        "1m": 60,
+        "5m": 300,
+        "15m": 900,
+        "1h": 3600,
+        "4h": 14_400,
+        "6h": 21_600,
+        "1d": 86_400,
+        "1w": 604_800,
+    }
+    return int(mapping.get(str(interval).lower(), 3600))
 
 
 def _max_drawdown(series: pd.Series) -> float:
@@ -50,12 +120,44 @@ def _slope(series: pd.Series) -> float:
     return float(np.polyfit(x, y, 1)[0])
 
 
+def _return_over(clean: pd.Series, periods: int) -> float:
+    if periods <= 0 or len(clean) <= periods:
+        return np.nan
+    return float(clean.iloc[-1] - clean.iloc[-1 - periods])
+
+
+def _rsi_wilder(clean: pd.Series, periods: int = 14) -> float:
+    values = pd.to_numeric(clean, errors="coerce").dropna()
+    if len(values) <= periods:
+        return np.nan
+    delta = values.diff()
+    gains = delta.clip(lower=0.0)
+    losses = -delta.clip(upper=0.0)
+    avg_gain = gains.ewm(alpha=1 / periods, adjust=False, min_periods=periods).mean()
+    avg_loss = losses.ewm(alpha=1 / periods, adjust=False, min_periods=periods).mean()
+    rs = avg_gain / avg_loss.replace(0.0, np.nan)
+    rsi = 100 - (100 / (1 + rs))
+    if rsi.empty:
+        return np.nan
+    return float(rsi.iloc[-1])
+
+
+def write_feature_metadata_json(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as handle:
+        json.dump({"features": FEATURE_METADATA}, handle, indent=2, ensure_ascii=True)
+
+
 def compute_asset_features(
     price_history_df: pd.DataFrame,
     *,
     interval: str,
     window_days: int,
     gap_fill_limit: int,
+    market_context_df: pd.DataFrame | None = None,
+    orderbook_df: pd.DataFrame | None = None,
+    volume_bars_df: pd.DataFrame | None = None,
+    as_of_ts: int | None = None,
 ) -> tuple[pd.DataFrame, dict[str, np.ndarray]]:
     if price_history_df.empty:
         return pd.DataFrame(columns=["asset_id", *FEATURE_COLUMNS]), {}
@@ -63,12 +165,45 @@ def compute_asset_features(
     rows: list[dict[str, Any]] = []
     curves: dict[str, np.ndarray] = {}
     freq = _to_pandas_freq(interval)
+    interval_s = _interval_to_seconds(interval)
+    points_per_day = max(1, int(round(86_400 / interval_s)))
+    now_ts = int(as_of_ts) if as_of_ts is not None else int(pd.Timestamp.utcnow().timestamp())
 
     working = price_history_df.copy()
     working["asset_id"] = working["asset_id"].astype(str)
     working["ts"] = pd.to_numeric(working["ts"], errors="coerce")
     working["price"] = pd.to_numeric(working["price"], errors="coerce")
     working = working.dropna(subset=["asset_id", "ts", "price"])
+
+    market_context_map: dict[str, dict[str, Any]] = {}
+    if market_context_df is not None and not market_context_df.empty and "asset_id" in market_context_df.columns:
+        context = market_context_df.copy()
+        context["asset_id"] = context["asset_id"].astype(str)
+        for key in ("start_ts", "end_ts"):
+            if key in context.columns:
+                context[key] = pd.to_numeric(context[key], errors="coerce")
+        market_context_map = context.drop_duplicates("asset_id", keep="last").set_index("asset_id").to_dict(orient="index")
+
+    orderbook_map: dict[str, pd.DataFrame] = {}
+    if orderbook_df is not None and not orderbook_df.empty and "asset_id" in orderbook_df.columns:
+        ob = orderbook_df.copy()
+        ob["asset_id"] = ob["asset_id"].astype(str)
+        for key in ("spread", "spread_pct", "bid_depth_5pct", "ask_depth_5pct", "snapshot_ts"):
+            if key in ob.columns:
+                ob[key] = pd.to_numeric(ob[key], errors="coerce")
+        for asset_id, group in ob.groupby("asset_id", dropna=False):
+            orderbook_map[str(asset_id)] = group.sort_values("snapshot_ts")
+
+    volume_map: dict[str, pd.DataFrame] = {}
+    if volume_bars_df is not None and not volume_bars_df.empty and "asset_id" in volume_bars_df.columns:
+        vb = volume_bars_df.copy()
+        vb["asset_id"] = vb["asset_id"].astype(str)
+        for key in ("ts", "volume", "buy_volume", "sell_volume", "trade_count"):
+            if key in vb.columns:
+                vb[key] = pd.to_numeric(vb[key], errors="coerce")
+        vb = vb.dropna(subset=["asset_id", "ts"])
+        for asset_id, group in vb.groupby("asset_id", dropna=False):
+            volume_map[str(asset_id)] = group.sort_values("ts")
 
     for asset_id, group in working.groupby("asset_id"):
         timestamps = pd.to_datetime(group["ts"].astype(np.int64), unit="s", utc=True)
@@ -101,6 +236,91 @@ def compute_asset_features(
         max_idx = int(np.argmax(clean.to_numpy(dtype=float)))
         time_of_max = max_idx / max(1, len(clean) - 1)
 
+        context = market_context_map.get(str(asset_id), {})
+        start_ts = context.get("start_ts")
+        end_ts = context.get("end_ts")
+        try:
+            start_ts_value = float(start_ts) if start_ts is not None and np.isfinite(start_ts) else np.nan
+        except Exception:
+            start_ts_value = np.nan
+        try:
+            end_ts_value = float(end_ts) if end_ts is not None and np.isfinite(end_ts) else np.nan
+        except Exception:
+            end_ts_value = np.nan
+        days_to_resolution = (end_ts_value - now_ts) / 86_400.0 if np.isfinite(end_ts_value) else np.nan
+        days_since_creation = (now_ts - start_ts_value) / 86_400.0 if np.isfinite(start_ts_value) else np.nan
+        pct_lifetime_elapsed = np.nan
+        if np.isfinite(start_ts_value) and np.isfinite(end_ts_value) and end_ts_value > start_ts_value:
+            pct_lifetime_elapsed = (now_ts - start_ts_value) / (end_ts_value - start_ts_value)
+
+        # Microstructure features
+        ob_group = orderbook_map.get(str(asset_id))
+        avg_spread = np.nan
+        avg_spread_pct = np.nan
+        spread_trend = np.nan
+        avg_depth = np.nan
+        if ob_group is not None and not ob_group.empty:
+            spreads = pd.to_numeric(ob_group.get("spread"), errors="coerce").dropna()
+            spread_pct = pd.to_numeric(ob_group.get("spread_pct"), errors="coerce").dropna()
+            if not spreads.empty:
+                avg_spread = float(spreads.mean())
+                if len(spreads) >= 2:
+                    spread_trend = _slope(spreads.reset_index(drop=True))
+            if not spread_pct.empty:
+                avg_spread_pct = float(spread_pct.mean())
+            if "bid_depth_5pct" in ob_group.columns and "ask_depth_5pct" in ob_group.columns:
+                depth_series = (
+                    pd.to_numeric(ob_group["bid_depth_5pct"], errors="coerce")
+                    + pd.to_numeric(ob_group["ask_depth_5pct"], errors="coerce")
+                ) / 2.0
+                depth_series = depth_series.dropna()
+                if not depth_series.empty:
+                    avg_depth = float(depth_series.mean())
+
+        # Volume features
+        avg_daily_volume = np.nan
+        volume_trend = np.nan
+        buy_sell_ratio = np.nan
+        volume_price_corr = np.nan
+        volume_group = volume_map.get(str(asset_id))
+        if volume_group is not None and not volume_group.empty:
+            day_frame = volume_group.copy()
+            day_frame["dt"] = pd.to_datetime(day_frame["ts"].astype("int64"), unit="s", utc=True).dt.floor("1d")
+            daily = day_frame.groupby("dt", dropna=False).agg(
+                volume=("volume", "sum"),
+                buy_volume=("buy_volume", "sum"),
+                sell_volume=("sell_volume", "sum"),
+            )
+            if not daily.empty:
+                avg_daily_volume = float(pd.to_numeric(daily["volume"], errors="coerce").dropna().mean())
+                vol_series = pd.to_numeric(daily["volume"], errors="coerce").dropna()
+                if len(vol_series) >= 2:
+                    volume_trend = _slope(vol_series.reset_index(drop=True))
+                buy_total = float(pd.to_numeric(daily["buy_volume"], errors="coerce").fillna(0.0).sum())
+                sell_total = float(pd.to_numeric(daily["sell_volume"], errors="coerce").fillna(0.0).sum())
+                if sell_total > 0:
+                    buy_sell_ratio = buy_total / sell_total
+
+                clean_daily = clean.resample("1d").last().dropna()
+                move_daily = clean_daily.diff().abs().dropna()
+                if not move_daily.empty:
+                    aligned = pd.concat([vol_series.rename("volume"), move_daily.rename("abs_move")], axis=1).dropna()
+                    if len(aligned) >= 3:
+                        volume_price_corr = float(aligned["volume"].corr(aligned["abs_move"]))
+
+        return_1d = _return_over(clean, points_per_day * 1)
+        return_7d = _return_over(clean, points_per_day * 7)
+        return_30d = _return_over(clean, points_per_day * 30)
+        lookback_7d = points_per_day * 7
+        zscore_7d = np.nan
+        if len(clean) > lookback_7d:
+            sample = clean.iloc[-lookback_7d:]
+            mean_ = float(sample.mean())
+            std_ = float(sample.std(ddof=0))
+            if std_ > 0:
+                zscore_7d = float((clean.iloc[-1] - mean_) / std_)
+        rsi_14 = _rsi_wilder(clean, periods=14)
+
         rows.append(
             {
                 "asset_id": asset_id,
@@ -115,6 +335,22 @@ def compute_asset_features(
                 "slope": _slope(clean),
                 "missing_ratio": missing_ratio,
                 "num_points": int(len(clean)),
+                "days_to_resolution": days_to_resolution,
+                "pct_lifetime_elapsed": pct_lifetime_elapsed,
+                "days_since_creation": days_since_creation,
+                "avg_spread": avg_spread,
+                "avg_spread_pct": avg_spread_pct,
+                "spread_trend": spread_trend,
+                "avg_depth": avg_depth,
+                "avg_daily_volume": avg_daily_volume,
+                "volume_trend": volume_trend,
+                "buy_sell_ratio": buy_sell_ratio,
+                "volume_price_corr": volume_price_corr,
+                "return_1d": return_1d,
+                "return_7d": return_7d,
+                "return_30d": return_30d,
+                "zscore_7d": zscore_7d,
+                "rsi_14": rsi_14,
             }
         )
         curves[asset_id] = filled.to_numpy(dtype=float)

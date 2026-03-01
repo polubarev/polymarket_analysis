@@ -28,6 +28,7 @@ def _parse_cli_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--data-dir", default="data")
     parser.add_argument("--max-points-per-line", type=int, default=1200)
+    parser.add_argument("--ui-mode", choices=["discovery", "full"], default="discovery")
     args, _ = parser.parse_known_args()
     return args
 
@@ -157,6 +158,9 @@ def load_data_bundle(data_dir_text: str) -> dict[str, Any]:
     price_history = _safe_read_parquet(data_dir / "price_history.parquet")
     market_quality = _safe_read_parquet(data_dir / "market_quality.parquet")
     clusters = _safe_read_parquet(data_dir / "clusters.parquet")
+    signals = _safe_read_parquet(data_dir / "signals.parquet")
+    backtest_results = _safe_read_parquet(data_dir / "backtest_results.parquet")
+    trade_candidates = _safe_read_parquet(data_dir / "trade_candidates.parquet")
 
     report_path = data_dir / "analysis" / "report.json"
     report: dict[str, Any] = {}
@@ -166,12 +170,31 @@ def load_data_bundle(data_dir_text: str) -> dict[str, Any]:
         except json.JSONDecodeError:
             report = {}
 
+    backtest_summary_path = data_dir / "analysis" / "backtest_summary.json"
+    backtest_summary: dict[str, Any] = {}
+    if backtest_summary_path.exists():
+        try:
+            backtest_summary = json.loads(backtest_summary_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            backtest_summary = {}
+
+    candidates_json_path = data_dir / "analysis" / "trade_candidates.json"
+    trade_candidates_json: dict[str, Any] = {}
+    if candidates_json_path.exists():
+        try:
+            trade_candidates_json = json.loads(candidates_json_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            trade_candidates_json = {}
+
     events = events.copy()
     markets = markets.copy()
     tokens = tokens.copy()
     price_history = price_history.copy()
     market_quality = market_quality.copy()
     clusters = clusters.copy()
+    signals = signals.copy()
+    backtest_results = backtest_results.copy()
+    trade_candidates = trade_candidates.copy()
 
     if not events.empty:
         events["event_id"] = pd.to_numeric(events["event_id"], errors="coerce").astype("Int64")
@@ -222,6 +245,31 @@ def load_data_bundle(data_dir_text: str) -> dict[str, Any]:
         clusters["asset_id"] = clusters["asset_id"].astype(str)
         clusters["cluster_id"] = pd.to_numeric(clusters["cluster_id"], errors="coerce").astype("Int64")
 
+    if not signals.empty:
+        signals["asset_id"] = signals["asset_id"].astype(str)
+        signals["market_id"] = signals["market_id"].astype(str)
+        if "ts" in signals.columns:
+            signals["ts"] = pd.to_numeric(signals["ts"], errors="coerce")
+            signals["timestamp"] = _unix_to_datetime(signals["ts"])
+        for col in ("confidence", "edge", "entry_price"):
+            if col in signals.columns:
+                signals[col] = pd.to_numeric(signals[col], errors="coerce")
+
+    if not backtest_results.empty:
+        for col in ("entry_ts", "exit_ts"):
+            if col in backtest_results.columns:
+                backtest_results[col] = pd.to_numeric(backtest_results[col], errors="coerce")
+        if "exit_ts" in backtest_results.columns:
+            backtest_results["exit_timestamp"] = _unix_to_datetime(backtest_results["exit_ts"])
+        for col in ("pnl", "return_pct", "hold_days", "position_size", "bankroll_at_entry"):
+            if col in backtest_results.columns:
+                backtest_results[col] = pd.to_numeric(backtest_results[col], errors="coerce")
+
+    if not trade_candidates.empty:
+        for col in ("expected_value", "edge", "confidence", "suggested_size", "current_price"):
+            if col in trade_candidates.columns:
+                trade_candidates[col] = pd.to_numeric(trade_candidates[col], errors="coerce")
+
     market_table = build_market_table(
         events=events,
         markets=markets,
@@ -239,9 +287,14 @@ def load_data_bundle(data_dir_text: str) -> dict[str, Any]:
         "price_history": price_history,
         "market_quality": market_quality,
         "clusters": clusters,
+        "signals": signals,
+        "backtest_results": backtest_results,
+        "trade_candidates": trade_candidates,
         "market_table": market_table,
         "tag_table": tag_table,
         "report": report,
+        "backtest_summary": backtest_summary,
+        "trade_candidates_json": trade_candidates_json,
     }
 
 
@@ -889,6 +942,101 @@ def render_tag_cluster_views(tag_table: pd.DataFrame, clusters: pd.DataFrame, re
         st.json(overview, expanded=False)
 
 
+def render_backtest_results(backtest_results: pd.DataFrame, backtest_summary: dict[str, Any]) -> None:
+    st.markdown("<p class='section-note'>Historical strategy P&L and trade outcomes.</p>", unsafe_allow_html=True)
+    if backtest_results is None or backtest_results.empty:
+        st.info("No backtest data available.")
+        return
+
+    c1, c2, c3, c4 = st.columns(4)
+    pnl_total = float(pd.to_numeric(backtest_results.get("pnl"), errors="coerce").fillna(0.0).sum())
+    trades = int(len(backtest_results))
+    win_rate = float((pd.to_numeric(backtest_results.get("pnl"), errors="coerce").fillna(0.0) > 0).mean()) if trades else 0.0
+    avg_hold = float(pd.to_numeric(backtest_results.get("hold_days"), errors="coerce").dropna().mean()) if trades else 0.0
+    c1.metric("Trades", f"{trades:,}")
+    c2.metric("Total PnL", f"{pnl_total:,.2f}")
+    c3.metric("Win Rate", f"{win_rate * 100:.1f}%")
+    c4.metric("Avg Hold Days", f"{avg_hold:.1f}")
+
+    curve = backtest_results[["exit_timestamp", "pnl"]].copy()
+    curve = curve.dropna(subset=["exit_timestamp"])
+    curve = curve.sort_values("exit_timestamp")
+    curve["cum_pnl"] = pd.to_numeric(curve["pnl"], errors="coerce").fillna(0.0).cumsum()
+    if not curve.empty:
+        st.line_chart(curve.set_index("exit_timestamp")[["cum_pnl"]], height=320)
+
+    if backtest_summary:
+        by_signal = backtest_summary.get("by_signal", {})
+        if isinstance(by_signal, dict) and by_signal:
+            rows = []
+            for signal_name, stats in by_signal.items():
+                if not isinstance(stats, dict):
+                    continue
+                rows.append({"signal_name": signal_name, **stats})
+            if rows:
+                st.markdown("#### Summary by Signal")
+                st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+
+    st.markdown("#### Trade Log")
+    show_cols = [
+        "signal_name",
+        "asset_id",
+        "market_id",
+        "direction",
+        "entry_price",
+        "exit_price",
+        "pnl",
+        "return_pct",
+        "hold_days",
+        "exit_reason",
+    ]
+    available = [col for col in show_cols if col in backtest_results.columns]
+    st.dataframe(backtest_results[available].sort_values("pnl", ascending=False), width="stretch", hide_index=True)
+
+
+def render_trade_candidates_panel(trade_candidates: pd.DataFrame, trade_candidates_json: dict[str, Any]) -> None:
+    st.markdown("<p class='section-note'>Current ranked trade ideas from active signals.</p>", unsafe_allow_html=True)
+    if trade_candidates is None or trade_candidates.empty:
+        rows = trade_candidates_json.get("candidates", []) if isinstance(trade_candidates_json, dict) else []
+        if not rows:
+            st.info("No trade candidates available.")
+            return
+        trade_candidates = pd.DataFrame(rows)
+
+    sort_col = "expected_value" if "expected_value" in trade_candidates.columns else "edge"
+    if sort_col in trade_candidates.columns:
+        trade_candidates = trade_candidates.sort_values(sort_col, ascending=False)
+    st.dataframe(trade_candidates, width="stretch", hide_index=True)
+
+
+def render_signal_analysis(signals: pd.DataFrame) -> None:
+    st.markdown("<p class='section-note'>Signal frequency, confidence, and edge diagnostics.</p>", unsafe_allow_html=True)
+    if signals is None or signals.empty:
+        st.info("No signal data available.")
+        return
+
+    if "signal_name" in signals.columns:
+        counts = signals.groupby("signal_name", dropna=False).size().reset_index(name="count").sort_values("count", ascending=False)
+        st.markdown("#### Signal Counts")
+        st.dataframe(counts, width="stretch", hide_index=True)
+
+    if "timestamp" in signals.columns and "confidence" in signals.columns:
+        frame = signals.dropna(subset=["timestamp", "confidence"]).copy()
+        if not frame.empty:
+            frame["day"] = frame["timestamp"].dt.floor("1d")
+            roll = frame.groupby(["day", "signal_name"], dropna=False)["confidence"].mean().reset_index()
+            pivot = roll.pivot_table(index="day", columns="signal_name", values="confidence", aggfunc="mean")
+            if not pivot.empty:
+                st.markdown("#### Mean Confidence Over Time")
+                st.line_chart(pivot, height=300)
+
+    if "confidence" in signals.columns and "edge" in signals.columns:
+        scatter = signals[["confidence", "edge", "signal_name"]].dropna().copy()
+        if not scatter.empty:
+            st.markdown("#### Confidence vs Edge")
+            st.scatter_chart(scatter, x="confidence", y="edge", color="signal_name")
+
+
 def run_app() -> None:
     args = _parse_cli_args()
 
@@ -985,9 +1133,12 @@ def run_app() -> None:
 
     render_kpis(filtered, total_markets=len(market_table))
 
-    tab1, tab2, tab3, tab4 = st.tabs(["Bet Explorer", "Event Explorer", "Market Map", "Tags and Clusters"])
+    tab_names = ["Bet Explorer", "Event Explorer", "Market Map", "Tags and Clusters"]
+    if args.ui_mode == "full":
+        tab_names.extend(["Backtest Results", "Trade Candidates", "Signal Analysis"])
+    tabs = st.tabs(tab_names)
 
-    with tab1:
+    with tabs[0]:
         st.markdown("<p class='section-note'>Explore the current filtered list, then inspect one market in detail.</p>", unsafe_allow_html=True)
         render_market_list(filtered)
 
@@ -1017,7 +1168,7 @@ def run_app() -> None:
                 max_points_per_line=max(200, int(args.max_points_per_line)),
             )
 
-    with tab2:
+    with tabs[1]:
         render_event_view(
             filtered=filtered,
             market_table=market_table,
@@ -1025,11 +1176,22 @@ def run_app() -> None:
             max_points_per_line=max(200, int(args.max_points_per_line)),
         )
 
-    with tab3:
+    with tabs[2]:
         render_market_map(filtered)
 
-    with tab4:
+    with tabs[3]:
         render_tag_cluster_views(bundle["tag_table"], bundle["clusters"], bundle["report"])
+
+    if args.ui_mode == "full":
+        with tabs[4]:
+            render_backtest_results(bundle.get("backtest_results", pd.DataFrame()), bundle.get("backtest_summary", {}))
+        with tabs[5]:
+            render_trade_candidates_panel(
+                bundle.get("trade_candidates", pd.DataFrame()),
+                bundle.get("trade_candidates_json", {}),
+            )
+        with tabs[6]:
+            render_signal_analysis(bundle.get("signals", pd.DataFrame()))
 
 
 def main() -> None:

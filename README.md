@@ -25,6 +25,33 @@ polymarket-pipeline \
   --yes-only-binary
 ```
 
+## Phase 2 Strategy Mode
+
+Run the full research pipeline (resolved ingestion, optional orderbook/volume, signals, backtest, candidates):
+
+```bash
+polymarket-pipeline \
+  --output-dir data \
+  --max-events 1000 \
+  --window-days 30 \
+  --interval 1h \
+  --yes-only-binary \
+  --include-resolved \
+  --resolved-lookback-days 365 \
+  --snapshot-orderbook \
+  --ingest-volume \
+  --run-signals \
+  --backtest \
+  --sizing-mode kelly \
+  --generate-candidates
+```
+
+Resolved-only backfill command:
+
+```bash
+polymarket-pipeline resolve --output-dir data --lookback-days 365
+```
+
 Optional trades validation sample:
 
 ```bash
@@ -37,6 +64,12 @@ After the parquet outputs exist, launch the interactive discovery app:
 
 ```bash
 streamlit run polymarket_pipeline/discovery_ui.py -- --data-dir data
+```
+
+Enable full research tabs (backtests, candidates, signal analysis):
+
+```bash
+streamlit run polymarket_pipeline/discovery_ui.py -- --data-dir data --ui-mode full
 ```
 
 What it includes:
@@ -111,9 +144,20 @@ When you need richer multi-outcome analysis, replace `--yes-only-binary` with `-
 - `data/markets.parquet`
 - `data/tokens.parquet`
 - `data/price_history.parquet`
+- `data/resolutions.parquet` (when `--include-resolved`)
+- `data/orderbook_snapshots.parquet` (when `--snapshot-orderbook`)
+- `data/volume_bars.parquet` (when `--ingest-volume`)
 - `data/market_quality.parquet`
+- `data/features.parquet`
 - `data/clusters.parquet`
+- `data/signals.parquet` (when `--run-signals`)
+- `data/backtest_results.parquet` + `data/analysis/backtest_summary.json` (when `--backtest`)
+- `data/trade_candidates.parquet` + `data/analysis/trade_candidates.json` (when `--generate-candidates`)
+- `data/market_relationships.parquet` (when `--detect-relationships`)
 - `data/analysis/report.json`
+- `data/analysis/feature_metadata.json`
+- `data/analysis/health_check.json`
+- `data/pipeline_runs.parquet`
 - `data/analysis/coverage_by_bet_type.png`
 - `data/analysis/cluster_<id>.png`
 

@@ -113,6 +113,8 @@ class JsonHttpClient:
             self.increment_metric("requests", 1)
             try:
                 response = self.session.get(url, params=params, timeout=self.timeout_s)
+                if response.status_code == 429:
+                    self.increment_metric("http_429", 1)
                 if response.status_code in RETRYABLE_STATUS_CODES:
                     raise requests.HTTPError(
                         f"Retryable status {response.status_code} for {url}",
@@ -254,6 +256,65 @@ class PolymarketClients:
                     return value
         raise ValueError("Unexpected Gamma /events response shape")
 
+    @staticmethod
+    def _normalize_book_levels(raw_levels: Any) -> list[tuple[float, float]]:
+        levels: list[tuple[float, float]] = []
+        if not isinstance(raw_levels, list):
+            return levels
+        for level in raw_levels:
+            price: Any = None
+            size: Any = None
+            if isinstance(level, dict):
+                price = level.get("price", level.get("p"))
+                size = level.get("size", level.get("s", level.get("quantity", level.get("q"))))
+            elif isinstance(level, (list, tuple)) and len(level) >= 2:
+                price, size = level[0], level[1]
+            if price is None or size is None:
+                continue
+            try:
+                p = float(price)
+                s = float(size)
+            except (TypeError, ValueError):
+                continue
+            if not (p > 0 and s >= 0):
+                continue
+            levels.append((p, s))
+        return levels
+
+    def fetch_order_book(self, *, asset_id: str) -> dict[str, Any]:
+        # Endpoint name and parameter name vary across CLOB versions.
+        attempts: list[tuple[str, dict[str, Any]]] = [
+            ("/book", {"token_id": str(asset_id)}),
+            ("/book", {"tokenId": str(asset_id)}),
+            ("/book", {"asset_id": str(asset_id)}),
+            ("/book", {"market": str(asset_id)}),
+            ("/orderbook", {"token_id": str(asset_id)}),
+            ("/orderbook", {"tokenId": str(asset_id)}),
+            ("/orderbook", {"asset_id": str(asset_id)}),
+            ("/orderbook", {"market": str(asset_id)}),
+        ]
+        for endpoint, params in attempts:
+            try:
+                payload = self.clob.get_json(endpoint, params=params)
+            except requests.HTTPError as exc:
+                status = exc.response.status_code if exc.response is not None else None
+                if status in {400, 404, 422}:
+                    continue
+                raise
+
+            if not isinstance(payload, dict):
+                continue
+            bids = self._normalize_book_levels(payload.get("bids", payload.get("buyOrders", payload.get("buy"))))
+            asks = self._normalize_book_levels(payload.get("asks", payload.get("sellOrders", payload.get("sell"))))
+            if not bids and not asks:
+                # Some payloads wrap levels in nested object.
+                book = payload.get("book")
+                if isinstance(book, dict):
+                    bids = self._normalize_book_levels(book.get("bids", book.get("buyOrders", book.get("buy"))))
+                    asks = self._normalize_book_levels(book.get("asks", book.get("sellOrders", book.get("sell"))))
+            return {"asset_id": str(asset_id), "bids": bids, "asks": asks, "raw": payload}
+        return {"asset_id": str(asset_id), "bids": [], "asks": [], "raw": {}}
+
     def fetch_prices_history(
         self,
         *,
@@ -322,3 +383,43 @@ class PolymarketClients:
                 if isinstance(value, list):
                     return value
         return []
+
+    def fetch_trades_all(
+        self,
+        *,
+        condition_id: str,
+        limit: int = 10_000,
+        max_pages: int = 100,
+        min_ts: int | None = None,
+    ) -> list[dict[str, Any]]:
+        all_rows: list[dict[str, Any]] = []
+        offset = 0
+
+        for _ in range(max_pages):
+            page = self.fetch_trades_page(condition_id=condition_id, limit=limit, offset=offset)
+            if not page:
+                break
+            all_rows.extend(page)
+            if len(page) < limit:
+                break
+            offset += limit
+
+            # If the API is sorted descending by time, we can stop once the
+            # page is fully older than min_ts.
+            if min_ts is not None:
+                page_ts: list[int] = []
+                for row in page:
+                    if not isinstance(row, dict):
+                        continue
+                    value = row.get("timestamp", row.get("ts", row.get("time")))
+                    try:
+                        ts = int(float(value))
+                    except (TypeError, ValueError):
+                        continue
+                    if ts > 10_000_000_000:
+                        ts //= 1000
+                    page_ts.append(ts)
+                if page_ts and max(page_ts) < int(min_ts):
+                    break
+
+        return all_rows
