@@ -18,6 +18,44 @@ def parse_gcs_uri(uri: str) -> tuple[str, str]:
     return bucket, prefix.strip("/")
 
 
+def download_directory(local_dir: Path, gcs_uri: str) -> int:
+    """Download all files from a GCS prefix into a local directory.
+
+    Preserves relative paths so that ``gs://bucket/prefix/a/b.parquet``
+    becomes ``<local_dir>/a/b.parquet``.  Existing local files are
+    overwritten (GCS is the source of truth between Cloud Run jobs).
+    """
+    try:
+        from google.cloud import storage
+    except ModuleNotFoundError as exc:
+        raise RuntimeError("google-cloud-storage is required for GCS sync; run pip install -e .") from exc
+
+    bucket_name, prefix = parse_gcs_uri(gcs_uri)
+    client = storage.Client()
+    bucket = client.bucket(bucket_name)
+
+    local_dir.mkdir(parents=True, exist_ok=True)
+    downloaded = 0
+    for blob in client.list_blobs(bucket, prefix=f"{prefix}/" if prefix else ""):
+        # Skip directory markers.
+        if blob.name.endswith("/"):
+            continue
+        relative = blob.name
+        if prefix:
+            relative = blob.name[len(prefix) :].lstrip("/")
+        if not relative:
+            continue
+        dest = local_dir / relative
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        blob.download_to_filename(str(dest))
+        downloaded += 1
+        if downloaded % 100 == 0:
+            LOGGER.info("Downloaded %s files from %s", downloaded, gcs_uri)
+
+    LOGGER.info("Downloaded %s files from %s to %s", downloaded, gcs_uri, local_dir)
+    return downloaded
+
+
 def upload_directory(local_dir: Path, gcs_uri: str) -> int:
     try:
         from google.cloud import storage
@@ -46,9 +84,15 @@ def upload_directory(local_dir: Path, gcs_uri: str) -> int:
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Upload pipeline output directory to GCS")
-    parser.add_argument("--local-dir", required=True, help="Local directory to upload")
+    parser = argparse.ArgumentParser(description="Sync pipeline output directory with GCS")
+    parser.add_argument("--local-dir", required=True, help="Local directory")
     parser.add_argument("--gcs-uri", required=True, help="Target gs://bucket/prefix URI")
+    parser.add_argument(
+        "--mode",
+        choices=["upload", "download"],
+        default="upload",
+        help="Direction of sync (default: upload)",
+    )
     parser.add_argument("--log-level", default="INFO", help="Python log level")
     return parser
 
@@ -61,8 +105,12 @@ def main() -> None:
         format="%(asctime)s %(levelname)s %(name)s - %(message)s",
     )
     local_dir = Path(args.local_dir)
-    uploaded = upload_directory(local_dir, args.gcs_uri)
-    LOGGER.info("Uploaded %s files from %s to %s", uploaded, local_dir, args.gcs_uri)
+    if args.mode == "download":
+        count = download_directory(local_dir, args.gcs_uri)
+        LOGGER.info("Downloaded %s files from %s to %s", count, args.gcs_uri, local_dir)
+    else:
+        count = upload_directory(local_dir, args.gcs_uri)
+        LOGGER.info("Uploaded %s files from %s to %s", count, local_dir, args.gcs_uri)
 
 
 if __name__ == "__main__":

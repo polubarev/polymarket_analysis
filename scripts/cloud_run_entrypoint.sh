@@ -64,10 +64,26 @@ if [[ -n "${EXTRA_PIPELINE_ARGS:-}" ]]; then
   args+=("${extra_args[@]}")
 fi
 
+# Download existing data from GCS so incremental mode has something to build on.
+# Cloud Run containers start with an empty filesystem, so without this step every
+# run would discard accumulated history and start from scratch.
+if [[ -n "${GCS_OUTPUT_URI:-}" ]]; then
+  echo "Downloading existing data from ${GCS_OUTPUT_URI} to ${OUTPUT_DIR}"
+  python -m polymarket_pipeline.gcs_sync \
+    --mode download \
+    --local-dir "${OUTPUT_DIR}" \
+    --gcs-uri "${GCS_OUTPUT_URI}" || {
+      echo "WARNING: GCS download failed (first run or bucket empty). Continuing with empty state."
+    }
+fi
+
 echo "Running pipeline with output dir: ${OUTPUT_DIR}"
 polymarket-pipeline "${args[@]}"
 
 if [[ -n "${GCS_OUTPUT_URI:-}" ]]; then
   echo "Uploading output to ${GCS_OUTPUT_URI}"
-  python -m polymarket_pipeline.gcs_sync --local-dir "${OUTPUT_DIR}" --gcs-uri "${GCS_OUTPUT_URI}"
+  python -m polymarket_pipeline.gcs_sync \
+    --mode upload \
+    --local-dir "${OUTPUT_DIR}" \
+    --gcs-uri "${GCS_OUTPUT_URI}"
 fi

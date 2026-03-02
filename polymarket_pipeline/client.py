@@ -315,6 +315,43 @@ class PolymarketClients:
             return {"asset_id": str(asset_id), "bids": bids, "asks": asks, "raw": payload}
         return {"asset_id": str(asset_id), "bids": [], "asks": [], "raw": {}}
 
+    # The CLOB /prices-history API rejects time ranges longer than ~14 days
+    # (returns 400 "startTs and endTs interval is too long").  We chunk the
+    # requested range into windows of at most _MAX_CHUNK_DAYS and concatenate.
+    _MAX_CHUNK_DAYS: int = 14
+
+    def _fetch_prices_history_chunk(
+        self,
+        *,
+        asset_id: str,
+        interval: str,
+        start_ts: int,
+        end_ts: int,
+    ) -> list[dict[str, Any]]:
+        """Fetch a single chunk of price history (must be <= _MAX_CHUNK_DAYS)."""
+        params: dict[str, Any] = {"market": str(asset_id)}
+        params["startTs"] = int(start_ts)
+        params["endTs"] = int(end_ts)
+        fidelity = self._interval_to_fidelity(interval)
+        if fidelity is not None:
+            params["fidelity"] = fidelity
+        else:
+            params["interval"] = interval
+        try:
+            payload = self.clob.get_json("/prices-history", params=params)
+        except requests.HTTPError as exc:
+            status = exc.response.status_code if exc.response is not None else None
+            if status in {400, 404}:
+                self.clob.increment_metric("price_history_http_error", 1)
+                return []
+            raise
+        if isinstance(payload, dict):
+            history = payload.get("history", [])
+            return history if isinstance(history, list) else []
+        if isinstance(payload, list):
+            return payload
+        return []
+
     def fetch_prices_history(
         self,
         *,
@@ -323,46 +360,44 @@ class PolymarketClients:
         start_ts: int,
         end_ts: int,
     ) -> list[dict[str, Any]]:
-        params: dict[str, Any] = {"market": str(asset_id)}
-        if start_ts and end_ts:
-            params["startTs"] = int(start_ts)
-            params["endTs"] = int(end_ts)
-            fidelity = self._interval_to_fidelity(interval)
-            if fidelity is not None:
-                params["fidelity"] = fidelity
-            else:
-                # If interval is unknown, rely on API-side interval parsing.
-                params["interval"] = interval
-        else:
-            params["interval"] = interval
-        try:
-            payload = self.clob.get_json("/prices-history", params=params)
-        except requests.HTTPError as exc:
-            status = exc.response.status_code if exc.response is not None else None
-            if status == 400:
-                fallback_interval = str(interval).strip().lower()
-                if fallback_interval not in {"1m", "1h", "6h", "1d", "1w", "max"}:
-                    fallback_interval = "max"
-                fallback_params = {"market": str(asset_id), "interval": fallback_interval}
-                try:
-                    payload = self.clob.get_json("/prices-history", params=fallback_params)
-                except requests.HTTPError as fallback_exc:
-                    fallback_status = fallback_exc.response.status_code if fallback_exc.response is not None else None
-                    if fallback_status in {400, 404}:
-                        self.clob.increment_metric("price_history_http_error", 1)
-                        return []
-                    raise
-            elif status == 404:
-                self.clob.increment_metric("price_history_http_error", 1)
-                return []
-            else:
+        if not start_ts or not end_ts:
+            # No time bounds: use interval-only call.
+            params: dict[str, Any] = {"market": str(asset_id), "interval": interval}
+            try:
+                payload = self.clob.get_json("/prices-history", params=params)
+            except requests.HTTPError as exc:
+                status = exc.response.status_code if exc.response is not None else None
+                if status in {400, 404}:
+                    return []
                 raise
-        if isinstance(payload, dict):
-            history = payload.get("history", [])
-            return history if isinstance(history, list) else []
-        if isinstance(payload, list):
-            return payload
-        return []
+            if isinstance(payload, dict):
+                h = payload.get("history", [])
+                return h if isinstance(h, list) else []
+            return payload if isinstance(payload, list) else []
+
+        chunk_seconds = self._MAX_CHUNK_DAYS * 86_400
+        all_points: list[dict[str, Any]] = []
+        chunk_start = int(start_ts)
+        end = int(end_ts)
+
+        while chunk_start < end:
+            chunk_end = min(chunk_start + chunk_seconds, end)
+            points = self._fetch_prices_history_chunk(
+                asset_id=asset_id,
+                interval=interval,
+                start_ts=chunk_start,
+                end_ts=chunk_end,
+            )
+            all_points.extend(points)
+            chunk_start = chunk_end
+
+        # Deduplicate by timestamp (chunks may overlap at boundaries).
+        seen: dict[int, dict[str, Any]] = {}
+        for point in all_points:
+            ts = point.get("t", point.get("ts"))
+            if ts is not None:
+                seen[int(ts)] = point
+        return sorted(seen.values(), key=lambda p: p.get("t", p.get("ts", 0)))
 
     def fetch_trades_page(
         self,
