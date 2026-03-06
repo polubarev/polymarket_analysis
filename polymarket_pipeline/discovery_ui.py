@@ -477,13 +477,14 @@ def downsample_history(
     df: pd.DataFrame,
     *,
     max_points_per_line: int,
-    group_col: str = "outcome_label",
+    group_col: str = "asset_id",
 ) -> pd.DataFrame:
     if df.empty:
         return df
 
     pieces: list[pd.DataFrame] = []
     for _, group in df.groupby(group_col, dropna=False):
+        group = group.sort_values("timestamp")
         if len(group) <= max_points_per_line:
             pieces.append(group)
             continue
@@ -506,15 +507,29 @@ def market_price_frame(
         return pd.DataFrame(columns=["timestamp", "price", "asset_id", "outcome_label"])
 
     market_tokens["asset_id"] = market_tokens["asset_id"].astype(str)
-    market_tokens["outcome_label"] = market_tokens["outcome"].fillna("Unknown")
+    # Keep per-token labels unique to avoid merging multiple assets into one line.
+    outcome_text = market_tokens["outcome"].astype("string").fillna("").str.strip()
+    market_tokens["outcome_label"] = outcome_text.where(outcome_text != "", market_tokens["asset_id"])
 
     frame = price_history.loc[price_history["asset_id"].isin(market_tokens["asset_id"]), ["timestamp", "price", "asset_id"]]
     if frame.empty:
         return pd.DataFrame(columns=["timestamp", "price", "asset_id", "outcome_label"])
 
     frame = frame.merge(market_tokens[["asset_id", "outcome_label"]], on="asset_id", how="left")
-    frame["outcome_label"] = frame["outcome_label"].fillna(frame["asset_id"])
-    frame = frame.sort_values(["outcome_label", "timestamp"])
+    frame["outcome_label"] = frame["outcome_label"].astype("string").fillna(frame["asset_id"])
+    frame["series_label"] = frame["outcome_label"]
+    label_assets = frame[["asset_id", "outcome_label"]].drop_duplicates()
+    duplicated_labels = set(
+        label_assets.groupby("outcome_label", dropna=False)["asset_id"].nunique().loc[lambda s: s > 1].index.astype(str)
+    )
+    if duplicated_labels:
+        duplicate_mask = frame["outcome_label"].isin(duplicated_labels)
+        frame.loc[duplicate_mask, "series_label"] = (
+            frame.loc[duplicate_mask, "outcome_label"].astype(str)
+            + " | "
+            + frame.loc[duplicate_mask, "asset_id"].astype(str).str.slice(0, 10)
+        )
+    frame = frame.sort_values(["asset_id", "timestamp"])
     return frame
 
 
@@ -639,7 +654,7 @@ def render_bet_detail(
     info_cols[2].markdown(f"**Market ID**: `{selected['market_id']}`")
 
     history = market_price_frame(str(selected_market_id), tokens=tokens, price_history=price_history)
-    history = downsample_history(history, max_points_per_line=max_points_per_line)
+    history = downsample_history(history, max_points_per_line=max_points_per_line, group_col="asset_id")
 
     if history.empty:
         st.info("No price history available for this market's tokens.")
@@ -647,14 +662,16 @@ def render_bet_detail(
         if alt is not None:
             chart = (
                 alt.Chart(history)
-                .mark_line(interpolate="monotone")
+                .mark_line(interpolate="linear")
                 .encode(
                     x=alt.X("timestamp:T", title="Time"),
                     y=alt.Y("price:Q", title="Price", scale=alt.Scale(domain=[0, 1])),
-                    color=alt.Color("outcome_label:N", title="Outcome"),
+                    color=alt.Color("series_label:N", title="Outcome"),
+                    detail=alt.Detail("asset_id:N"),
                     tooltip=[
                         alt.Tooltip("timestamp:T", title="Time"),
                         alt.Tooltip("outcome_label:N", title="Outcome"),
+                        alt.Tooltip("series_label:N", title="Series"),
                         alt.Tooltip("price:Q", format=".4f", title="Price"),
                         alt.Tooltip("asset_id:N", title="Asset ID"),
                     ],
@@ -664,7 +681,7 @@ def render_bet_detail(
             )
             st.altair_chart(_style_altair_chart(chart), width="stretch")
         else:
-            pivot = history.pivot_table(index="timestamp", columns="outcome_label", values="price", aggfunc="last")
+            pivot = history.pivot_table(index="timestamp", columns="series_label", values="price", aggfunc="last")
             st.line_chart(pivot, height=350)
 
         latest = history.sort_values("timestamp").groupby("outcome_label", as_index=False).tail(1)
@@ -1114,7 +1131,18 @@ def run_app() -> None:
         index=0,
     )
     sort_desc = st.sidebar.checkbox("Descending", value=True)
-    row_limit = st.sidebar.slider("Max rows", min_value=25, max_value=1000, value=250, step=25)
+    total_rows = int(len(market_table))
+    row_limit_max = max(1000, total_rows)
+    row_limit_default = min(250, row_limit_max)
+    row_limit = st.sidebar.slider(
+        "Max rows",
+        min_value=25,
+        max_value=row_limit_max,
+        value=row_limit_default,
+        step=25,
+    )
+    if row_limit_max > 1000:
+        st.sidebar.caption(f"Dataset size: {total_rows:,} rows.")
 
     filtered = apply_market_filters(
         market_table,
