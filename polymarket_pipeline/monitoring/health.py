@@ -51,6 +51,17 @@ def build_health_check(
     median_points = float(coverage.get("median_points_per_token", 0.0) or 0.0)
     retries = int(metrics.get("retries", 0))
     rate_limited = int(metrics.get("http_429", 0))
+    cadence_checked_assets = int(metrics.get("cadence_checked_assets", 0))
+    cadence_mismatch_assets = int(metrics.get("cadence_mismatch_assets", 0))
+    cadence_mismatch_ratio = (
+        float(cadence_mismatch_assets / cadence_checked_assets) if cadence_checked_assets > 0 else 0.0
+    )
+    pipeline_profile = str(config_payload.get("pipeline_profile", "default"))
+    signals_expected = bool(
+        config_payload.get("run_signals")
+        or config_payload.get("run_backtest")
+        or config_payload.get("generate_candidates")
+    )
 
     checks.extend(
         [
@@ -88,6 +99,13 @@ def build_health_check(
                 "threshold": 250,
                 "severity": "WARNING",
                 "passed": retries <= 250,
+            },
+            {
+                "name": "history_cadence_mismatch_ratio",
+                "value": cadence_mismatch_ratio,
+                "threshold": "<= 0.2",
+                "severity": "CRITICAL",
+                "passed": cadence_checked_assets == 0 or cadence_mismatch_ratio <= 0.2,
             },
         ]
     )
@@ -181,6 +199,8 @@ def build_health_check(
     payload = {
         "run_ts": datetime.now(timezone.utc).isoformat(),
         "status": status,
+        "pipeline_profile": pipeline_profile,
+        "signals_expected": signals_expected,
         "checks": checks,
         "warnings": warnings,
         "errors": errors,
@@ -193,6 +213,8 @@ def build_health_check(
         "markets_count": int(markets_count),
         "price_coverage_pct": coverage_pct,
         "signals_generated": int(signals_generated),
+        "signals_expected": bool(signals_expected),
+        "pipeline_profile": pipeline_profile,
         "status": status,
         "config_hash": _config_hash(config_payload),
     }

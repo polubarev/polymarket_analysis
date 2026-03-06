@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Callable
 from typing import Any
 
 import numpy as np
@@ -23,17 +24,28 @@ class MeanReversionSpikeSignal(Signal):
         price_history: pd.Series,
         volume_history: pd.Series | None,
         as_of_ts: int,
+        record_debug: Callable[[str], None] | None = None,
     ) -> SignalOutput | None:
         current_price = _latest_price(price_history)
-        if current_price is None or len(price_history) < 24:
+        if current_price is None:
+            if record_debug is not None:
+                record_debug("missing_price")
+            return None
+        if len(price_history) < 24:
+            if record_debug is not None:
+                record_debug("insufficient_points")
             return None
 
         zscore = features.get("zscore_7d")
         try:
             z = float(zscore)
         except (TypeError, ValueError):
+            if record_debug is not None:
+                record_debug("missing_zscore_7d")
             return None
         if not np.isfinite(z) or abs(z) < float(self.zscore_threshold):
+            if record_debug is not None:
+                record_debug("threshold_fail")
             return None
 
         # Optional thin-volume filter: spike should happen on below-median volume.
@@ -43,6 +55,8 @@ class MeanReversionSpikeSignal(Signal):
                 latest_volume = float(volume_series.iloc[-1])
                 median_volume = float(volume_series.median())
                 if latest_volume >= median_volume:
+                    if record_debug is not None:
+                        record_debug("volume_not_thin")
                     return None
 
         direction = "sell" if z > 0 else "buy"

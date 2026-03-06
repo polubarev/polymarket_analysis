@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Callable
 from typing import Any
 
 import pandas as pd
@@ -23,16 +24,23 @@ class CalibrationMispricingSignal(Signal):
         price_history: pd.Series,
         volume_history: pd.Series | None,
         as_of_ts: int,
+        record_debug: Callable[[str], None] | None = None,
     ) -> SignalOutput | None:
         current_price = _latest_price(price_history)
         if current_price is None:
+            if record_debug is not None:
+                record_debug("missing_price")
             return None
         tag = str(market_row.get("primary_tag", "unknown")).strip().lower() or "unknown"
         base_rate = self.base_rate_by_tag.get(tag)
         if base_rate is None:
+            if record_debug is not None:
+                record_debug("missing_base_rate")
             return None
         diff = float(base_rate - current_price)
         if abs(diff) < float(self.threshold):
+            if record_debug is not None:
+                record_debug("threshold_fail")
             return None
 
         direction = "buy" if diff > 0 else "sell"

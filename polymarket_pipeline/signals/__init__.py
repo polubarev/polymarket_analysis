@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from typing import Callable
 from typing import Any
 
 import numpy as np
@@ -53,6 +54,7 @@ class Signal(ABC):
         price_history: pd.Series,
         volume_history: pd.Series | None,
         as_of_ts: int,
+        record_debug: Callable[[str], None] | None = None,
     ) -> SignalOutput | None:
         raise NotImplementedError
 

@@ -6,7 +6,8 @@ from pathlib import Path
 
 @dataclass(slots=True)
 class PipelineConfig:
-    output_dir: Path = Path("data")
+    output_dir: Path = Path("data/dev")
+    pipeline_profile: str = "default"
     max_events: int = 2000
     page_limit: int = 100
     window_days: int = 90
@@ -31,9 +32,11 @@ class PipelineConfig:
     quality_min_liquidity: float = 0.0
     tag_rank_top_n: int = 10
     price_fetch_workers: int = 16
+    fetch_priority_mode: str = "history_first"
     incremental_prices: bool = True
     incremental_mode: str = "tail"
     incremental_overlap_points: int = 2
+    skip_inactive_priced_assets: bool = True
     write_raw_price_files: bool = True
     http_pool_maxsize: int = 64
 
@@ -52,6 +55,8 @@ class PipelineConfig:
     # Task 5: Signals
     run_signals: bool = False
     active_signals: list[str] = field(default_factory=lambda: ["all"])
+    signal_debug: bool = False
+    signal_debug_limit: int = 20
     calibration_threshold: float = 0.15
     spike_zscore_threshold: float = 2.5
     convergence_days_threshold: int = 7

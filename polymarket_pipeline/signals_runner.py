@@ -11,6 +11,50 @@ from .backtesting.sizing import choose_position_size
 from .signals import Signal, build_registry
 
 
+class SignalDebugTracker:
+    def __init__(self, *, enabled: bool, signal_names: list[str], sample_limit: int) -> None:
+        self.enabled = bool(enabled)
+        self.sample_limit = max(0, int(sample_limit))
+        self._signals: dict[str, dict[str, Any]] = {
+            str(name): {"considered": 0, "generated": 0, "samples": {}} for name in signal_names
+        }
+
+    def bump(self, signal_name: str, key: str, sample: dict[str, Any] | None = None) -> None:
+        signal_key = str(signal_name)
+        if signal_key not in self._signals:
+            self._signals[signal_key] = {"considered": 0, "generated": 0, "samples": {}}
+        entry = self._signals[signal_key]
+        entry[key] = int(entry.get(key, 0)) + 1
+        if not self.enabled or sample is None or self.sample_limit <= 0:
+            return
+        samples = entry.setdefault("samples", {})
+        bucket = samples.setdefault(str(key), [])
+        if len(bucket) < self.sample_limit:
+            bucket.append(sample)
+
+    def recorder(self, signal_name: str, sample: dict[str, Any]) -> Any:
+        def _record(reason: str) -> None:
+            self.bump(signal_name, reason, sample=sample)
+
+        return _record
+
+    def payload(self) -> dict[str, Any]:
+        signals: dict[str, dict[str, Any]] = {}
+        for signal_name, metrics in self._signals.items():
+            entry = {
+                key: value
+                for key, value in metrics.items()
+                if key != "samples"
+            }
+            if self.enabled:
+                entry["samples"] = metrics.get("samples", {})
+            signals[signal_name] = entry
+        return {
+            "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+            "signals": signals,
+        }
+
+
 def _build_asset_series(price_history_df: pd.DataFrame) -> dict[str, pd.Series]:
     if price_history_df.empty:
         return {}
@@ -87,7 +131,7 @@ def run_signal_generation(
     volume_bars_df: pd.DataFrame | None,
     resolutions_df: pd.DataFrame | None,
     as_of_ts: int | None = None,
-) -> tuple[pd.DataFrame, dict[str, Signal]]:
+) -> tuple[pd.DataFrame, dict[str, Signal], dict[str, Any] | None]:
     columns = [
         "signal_name",
         "asset_id",
@@ -100,9 +144,6 @@ def run_signal_generation(
         "edge",
         "metadata_json",
     ]
-    if features_df.empty:
-        return pd.DataFrame(columns=columns), {}
-
     base_rates = compute_base_rate_by_tag(
         resolutions_df=resolutions_df if resolutions_df is not None else pd.DataFrame(),
         markets_df=markets_df,
@@ -118,12 +159,25 @@ def run_signal_generation(
         active_names = list(registry.keys())
     else:
         active_names = [name for name in requested if name in registry]
+    debug_tracker = SignalDebugTracker(
+        enabled=bool(getattr(config, "signal_debug", False)),
+        signal_names=active_names if active_names else list(registry.keys()),
+        sample_limit=int(getattr(config, "signal_debug_limit", 20)),
+    )
     if not active_names:
-        return pd.DataFrame(columns=columns), registry_by_name
+        return pd.DataFrame(columns=columns), registry_by_name, debug_tracker.payload()
+    if features_df.empty:
+        for signal_name in active_names:
+            debug_tracker.bump(signal_name, "features_empty")
+        return pd.DataFrame(columns=columns), registry_by_name, debug_tracker.payload()
 
     token_market = target_tokens_df[["asset_id", "market_id"]].drop_duplicates().copy()
     token_market["asset_id"] = token_market["asset_id"].astype(str)
     token_market["market_id"] = token_market["market_id"].astype(str)
+    if token_market.empty:
+        for signal_name in active_names:
+            debug_tracker.bump(signal_name, "target_tokens_empty")
+        return pd.DataFrame(columns=columns), registry_by_name, debug_tracker.payload()
 
     market_fields = ["market_id", "question", "liquidity", "resolved", "resolution_outcome", "resolution_ts"]
     if "event_id" in markets_df.columns:
@@ -147,7 +201,9 @@ def run_signal_generation(
     features["asset_id"] = features["asset_id"].astype(str)
     merged = token_market.merge(features, on="asset_id", how="inner").merge(market_meta, on="market_id", how="left")
     if merged.empty:
-        return pd.DataFrame(columns=columns), registry_by_name
+        for signal_name in active_names:
+            debug_tracker.bump(signal_name, "merged_features_empty")
+        return pd.DataFrame(columns=columns), registry_by_name, debug_tracker.payload()
 
     series_map = _build_asset_series(price_history_df)
     volume_map = _build_asset_volume_series(volume_bars_df if volume_bars_df is not None else pd.DataFrame())
@@ -158,13 +214,20 @@ def run_signal_generation(
         asset_id = str(row["asset_id"])
         market_id = str(row["market_id"])
         price_series = series_map.get(asset_id)
-        if price_series is None or price_series.empty:
-            continue
         volume_series = volume_map.get(asset_id)
         market_row = row.to_dict()
         feature_row = row.to_dict()
+        sample = {
+            "asset_id": asset_id,
+            "market_id": market_id,
+            "primary_tag": str(row.get("primary_tag", "unknown")),
+        }
 
         for signal_name in active_names:
+            debug_tracker.bump(signal_name, "considered", sample=sample)
+            if price_series is None or price_series.empty:
+                debug_tracker.bump(signal_name, "missing_price_history", sample=sample)
+                continue
             signal = registry[signal_name]
             output = signal.compute(
                 asset_id=asset_id,
@@ -173,18 +236,20 @@ def run_signal_generation(
                 price_history=price_series,
                 volume_history=volume_series,
                 as_of_ts=now_ts,
+                record_debug=debug_tracker.recorder(signal_name, sample),
             )
             if output is None:
                 continue
+            debug_tracker.bump(signal_name, "generated", sample=sample)
             rows.append(output.as_record(signal_name=signal.name, asset_id=asset_id, market_id=market_id, ts=now_ts))
 
     out = pd.DataFrame(rows, columns=columns)
     if out.empty:
-        return out, registry
+        return out, registry_by_name, debug_tracker.payload()
     out["asset_id"] = out["asset_id"].astype(str)
     out["market_id"] = out["market_id"].astype(str)
     out = out.sort_values(["ts", "signal_name", "asset_id"]).reset_index(drop=True)
-    return out, registry_by_name
+    return out, registry_by_name, debug_tracker.payload()
 
 
 def generate_trade_candidates(

@@ -10,13 +10,15 @@ from .pipeline import PipelineRunner
 
 
 def _add_common_pipeline_flags(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--output-dir", default="data", help="Output directory for raw + parquet + reports")
+    parser.add_argument("--output-dir", default="data/dev", help="Output directory for raw + parquet + reports")
+    parser.add_argument("--pipeline-profile", default="default", help="Logical profile label for run tracking")
     parser.add_argument("--max-events", type=int, default=2000, help="Maximum number of active events to ingest")
     parser.add_argument("--page-limit", type=int, default=100, help="Gamma events page size")
     parser.add_argument("--window-days", type=int, default=90, help="Lookback window for prices-history")
     parser.add_argument("--interval", default="1h", help="CLOB prices-history interval (e.g. 1h)")
     parser.add_argument("--timeout", type=float, default=20.0, help="HTTP timeout in seconds")
     parser.add_argument("--max-retries", type=int, default=5, help="HTTP retry count")
+    parser.add_argument("--rate-window-s", type=int, default=10, help="Token-bucket refill window in seconds")
     parser.add_argument("--yes-only-binary", action="store_true", help="Only fetch YES token for binary markets")
     parser.add_argument("--all-outcomes", action="store_true", help="Fetch all outcomes, including binary NO tokens")
     parser.add_argument("--fetch-trades-sample", type=int, default=0, help="Optional number of condition IDs for trades")
@@ -49,6 +51,12 @@ def _add_common_pipeline_flags(parser: argparse.ArgumentParser) -> None:
         help="Number of concurrent workers for prices-history fetching",
     )
     parser.add_argument(
+        "--fetch-priority-mode",
+        choices=["history_first", "category_round_robin"],
+        default="history_first",
+        help="How to order price-history fetches under constrained request budget",
+    )
+    parser.add_argument(
         "--no-incremental-prices",
         action="store_true",
         help="Always refetch prices even when existing interval data is already stored",
@@ -69,6 +77,12 @@ def _add_common_pipeline_flags(parser: argparse.ArgumentParser) -> None:
         "--skip-raw-price-files",
         action="store_true",
         help="Do not write per-asset raw/parquet price files (faster, less disk)",
+    )
+    parser.add_argument(
+        "--skip-inactive-priced-assets",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Skip inactive assets that already have stored price history",
     )
     parser.add_argument(
         "--http-pool-maxsize",
@@ -93,6 +107,8 @@ def _add_common_pipeline_flags(parser: argparse.ArgumentParser) -> None:
         default="all",
         help="Comma-separated signal names, e.g. calibration,mean_reversion",
     )
+    parser.add_argument("--signal-debug", action="store_true", help="Write signal evaluation diagnostics")
+    parser.add_argument("--signal-debug-limit", type=int, default=20, help="Sample cap per signal debug reason")
     parser.add_argument("--calibration-threshold", type=float, default=0.15)
     parser.add_argument("--spike-zscore-threshold", type=float, default=2.5)
     parser.add_argument("--convergence-days-threshold", type=int, default=7)
@@ -129,12 +145,13 @@ def _build_run_parser() -> argparse.ArgumentParser:
 
 def _build_resolve_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Resolved-market ingestion")
-    parser.add_argument("--output-dir", default="data", help="Output directory")
+    parser.add_argument("--output-dir", default="data/dev", help="Output directory")
     parser.add_argument("--lookback-days", type=int, default=365, help="How far back to ingest closed events")
     parser.add_argument("--page-limit", type=int, default=100, help="Gamma page size")
     parser.add_argument("--max-events", type=int, default=20_000, help="Maximum resolved events to ingest")
     parser.add_argument("--timeout", type=float, default=20.0, help="HTTP timeout in seconds")
     parser.add_argument("--max-retries", type=int, default=5, help="HTTP retry count")
+    parser.add_argument("--rate-window-s", type=int, default=10, help="Token-bucket refill window in seconds")
     parser.add_argument("--http-pool-maxsize", type=int, default=64, help="HTTP connection pool max size")
     parser.add_argument("--log-level", default="INFO", help="Python log level")
     return parser
@@ -154,12 +171,14 @@ def _config_from_run_args(args: argparse.Namespace) -> PipelineConfig:
 
     return PipelineConfig(
         output_dir=Path(args.output_dir),
+        pipeline_profile=args.pipeline_profile,
         max_events=args.max_events,
         page_limit=args.page_limit,
         window_days=args.window_days,
         interval=args.interval,
         request_timeout_s=args.timeout,
         max_retries=args.max_retries,
+        rate_window_s=args.rate_window_s,
         yes_only_binary=yes_only,
         fetch_trades_sample=args.fetch_trades_sample,
         cluster_k=args.cluster_k,
@@ -170,9 +189,11 @@ def _config_from_run_args(args: argparse.Namespace) -> PipelineConfig:
         quality_min_liquidity=args.quality_min_liquidity,
         tag_rank_top_n=args.tag_rank_top_n,
         price_fetch_workers=args.price_fetch_workers,
+        fetch_priority_mode=args.fetch_priority_mode,
         incremental_prices=not args.no_incremental_prices,
         incremental_mode=args.incremental_mode,
         incremental_overlap_points=args.incremental_overlap_points,
+        skip_inactive_priced_assets=args.skip_inactive_priced_assets,
         write_raw_price_files=not args.skip_raw_price_files,
         http_pool_maxsize=args.http_pool_maxsize,
         include_resolved=args.include_resolved,
@@ -183,6 +204,8 @@ def _config_from_run_args(args: argparse.Namespace) -> PipelineConfig:
         volume_fetch_workers=args.volume_fetch_workers,
         run_signals=args.run_signals,
         active_signals=_parse_active_signals(args.signals),
+        signal_debug=args.signal_debug,
+        signal_debug_limit=args.signal_debug_limit,
         calibration_threshold=args.calibration_threshold,
         spike_zscore_threshold=args.spike_zscore_threshold,
         convergence_days_threshold=args.convergence_days_threshold,
@@ -214,10 +237,12 @@ def _config_from_run_args(args: argparse.Namespace) -> PipelineConfig:
 def _config_from_resolve_args(args: argparse.Namespace) -> PipelineConfig:
     return PipelineConfig(
         output_dir=Path(args.output_dir),
+        pipeline_profile="resolve",
         max_events=int(args.max_events),
         page_limit=int(args.page_limit),
         request_timeout_s=float(args.timeout),
         max_retries=int(args.max_retries),
+        rate_window_s=int(args.rate_window_s),
         include_resolved=True,
         resolved_lookback_days=int(args.lookback_days),
         http_pool_maxsize=int(args.http_pool_maxsize),

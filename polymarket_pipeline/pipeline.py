@@ -4,7 +4,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import logging
 import time
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -35,6 +35,14 @@ from .storage import read_parquet_if_exists, upsert_parquet, write_jsonl
 LOGGER = logging.getLogger(__name__)
 
 
+@dataclass(slots=True)
+class PriceFetchTask:
+    asset_id: str
+    start_ts: int
+    bucket: str
+    primary_tag: str
+
+
 class PipelineRunner:
     def __init__(self, config: PipelineConfig) -> None:
         self.config = config
@@ -44,6 +52,9 @@ class PipelineRunner:
             "empty_histories": 0,
             "price_history_errors": 0,
             "http_429": 0,
+            "skipped_price_assets": 0,
+            "skipped_existing_history_assets": 0,
+            "skipped_inactive_priced_assets": 0,
         }
 
     def run(self) -> dict[str, Path]:
@@ -88,7 +99,12 @@ class PipelineRunner:
         outputs["tokens"] = tokens_path
 
         target_tokens_df = select_price_tokens(tokens_df, markets_df, yes_only_binary=self.config.yes_only_binary)
-        price_history_df = self._ingest_price_history(clients, target_tokens_df)
+        price_history_df = self._ingest_price_history(
+            clients,
+            target_tokens_df,
+            markets_df=markets_df,
+            events_df=events_df,
+        )
         outputs["price_history"] = self.config.output_dir / "price_history.parquet"
 
         resolutions_df = pd.DataFrame()
@@ -157,8 +173,9 @@ class PipelineRunner:
 
         signals_df = pd.DataFrame()
         signal_registry: dict[str, Any] = {}
+        signal_debug_payload: dict[str, Any] | None = None
         if self.config.run_signals or self.config.run_backtest or self.config.generate_candidates:
-            signals_new, signal_registry = run_signal_generation(
+            signals_new, signal_registry, signal_debug_payload = run_signal_generation(
                 config=self.config,
                 features_df=features_df,
                 target_tokens_df=target_tokens_df,
@@ -176,6 +193,11 @@ class PipelineRunner:
                 sort_keys=["ts", "signal_name", "asset_id"],
             )
             outputs["signals"] = signals_path
+            if self.config.signal_debug and signal_debug_payload is not None:
+                signal_debug_path = self.config.analysis_dir / "signal_debug.json"
+                with signal_debug_path.open("w", encoding="utf-8") as handle:
+                    json.dump(signal_debug_payload, handle, indent=2, ensure_ascii=True)
+                outputs["signal_debug"] = signal_debug_path
 
         if self.config.run_backtest:
             backtest_results_df, backtest_summary = run_backtest(
@@ -764,7 +786,14 @@ class PipelineRunner:
             )
         return rows
 
-    def _ingest_price_history(self, clients: PolymarketClients, target_tokens_df: pd.DataFrame) -> pd.DataFrame:
+    def _ingest_price_history(
+        self,
+        clients: PolymarketClients,
+        target_tokens_df: pd.DataFrame,
+        *,
+        markets_df: pd.DataFrame,
+        events_df: pd.DataFrame,
+    ) -> pd.DataFrame:
         price_path = self.config.output_dir / "price_history.parquet"
         output_columns = ["asset_id", "ts", "price", "interval", "ingested_at"]
         if target_tokens_df.empty:
@@ -775,7 +804,6 @@ class PipelineRunner:
                 sort_keys=["asset_id", "ts"],
             )
 
-        asset_ids = target_tokens_df["asset_id"].dropna().astype(str).drop_duplicates().tolist()
         now_ts = int(time.time())
         global_start_ts = now_ts - self.config.window_days * 24 * 60 * 60
         ingested_at = int(time.time())
@@ -802,52 +830,25 @@ class PipelineRunner:
         if incremental_mode not in {"tail", "skip"}:
             incremental_mode = "tail"
 
-        fetch_plan: list[tuple[str, int]] = []
-        if not self.config.incremental_prices:
-            fetch_plan = [(asset_id, global_start_ts) for asset_id in asset_ids]
-            self.metrics["skipped_price_assets"] = 0
-            LOGGER.info("Incremental disabled; fetching prices-history for %s assets", len(fetch_plan))
-        elif incremental_mode == "skip":
-            fetch_plan = [(asset_id, global_start_ts) for asset_id in asset_ids if asset_id not in existing_latest_ts]
-            skipped_assets = len(asset_ids) - len(fetch_plan)
-            self.metrics["skipped_price_assets"] = skipped_assets
-            if skipped_assets > 0:
-                LOGGER.info(
-                    "Skipping %s assets with existing %s interval history; fetching %s assets",
-                    skipped_assets,
-                    self.config.interval,
-                    len(fetch_plan),
-                )
-            else:
-                LOGGER.info("Fetching prices-history for %s assets", len(fetch_plan))
-        else:
-            interval_s = self._interval_to_seconds(self.config.interval) or 3600
-            overlap_points = max(0, int(self.config.incremental_overlap_points))
-            overlap_s = overlap_points * interval_s
-            existing_count = 0
-            for asset_id in asset_ids:
-                latest_ts = existing_latest_ts.get(asset_id)
-                if latest_ts is None:
-                    fetch_plan.append((asset_id, global_start_ts))
-                else:
-                    existing_count += 1
-                    fetch_plan.append((asset_id, max(global_start_ts, int(latest_ts) - overlap_s)))
-            self.metrics["skipped_price_assets"] = 0
-            LOGGER.info(
-                "Tail refresh for %s assets (%s existing, %s new), overlap_points=%s",
-                len(fetch_plan),
-                existing_count,
-                len(fetch_plan) - existing_count,
-                overlap_points,
-            )
+        fetch_plan = self._build_price_fetch_plan(
+            target_tokens_df=target_tokens_df,
+            markets_df=markets_df,
+            events_df=events_df,
+            existing_latest_ts=existing_latest_ts,
+            incremental_mode=incremental_mode,
+            now_ts=now_ts,
+            global_start_ts=global_start_ts,
+        )
 
         if not fetch_plan:
-            return upsert_parquet(
+            combined_df = upsert_parquet(
                 price_path,
                 pd.DataFrame(columns=output_columns),
                 dedupe_keys=["asset_id", "ts", "interval"],
                 sort_keys=["asset_id", "ts"],
             )
+            self._log_history_cadence_sanity(combined_df)
+            return combined_df
 
         all_rows: list[dict[str, Any]] = []
 
@@ -873,11 +874,12 @@ class PipelineRunner:
         completed = 0
         with ThreadPoolExecutor(max_workers=worker_count) as executor:
             future_map = {
-                executor.submit(fetch_one, asset_id, fetch_start_ts): asset_id
-                for asset_id, fetch_start_ts in fetch_plan
+                executor.submit(fetch_one, task.asset_id, task.start_ts): task
+                for task in fetch_plan
             }
             for future in as_completed(future_map):
-                asset_id = future_map[future]
+                task = future_map[future]
+                asset_id = task.asset_id
                 try:
                     _, rows, error = future.result()
                 except Exception as exc:
@@ -892,8 +894,12 @@ class PipelineRunner:
 
                 if not rows:
                     self.metrics["empty_histories"] = self.metrics.get("empty_histories", 0) + 1
+                    empty_key = f"empty_histories_{task.bucket}"
+                    self.metrics[empty_key] = self.metrics.get(empty_key, 0) + 1
                 else:
                     all_rows.extend(rows)
+                    completed_key = f"non_empty_histories_{task.bucket}"
+                    self.metrics[completed_key] = self.metrics.get(completed_key, 0) + 1
                     if self.config.write_raw_price_files:
                         raw_df = pd.DataFrame(rows, columns=output_columns)
                         raw_path = self.config.raw_prices_dir / f"{asset_id}.parquet"
@@ -904,14 +910,224 @@ class PipelineRunner:
                     LOGGER.info("Price histories fetched: %s / %s", completed, len(fetch_plan))
 
         new_df = pd.DataFrame(all_rows, columns=output_columns)
-        self._log_history_cadence_sanity(new_df)
-
-        return upsert_parquet(
+        combined_df = upsert_parquet(
             price_path,
             new_df,
             dedupe_keys=["asset_id", "ts", "interval"],
             sort_keys=["asset_id", "ts"],
         )
+        self._log_history_cadence_sanity(combined_df)
+        return combined_df
+
+    def _build_price_fetch_plan(
+        self,
+        *,
+        target_tokens_df: pd.DataFrame,
+        markets_df: pd.DataFrame,
+        events_df: pd.DataFrame,
+        existing_latest_ts: dict[str, int],
+        incremental_mode: str,
+        now_ts: int,
+        global_start_ts: int,
+    ) -> list[PriceFetchTask]:
+        metadata = self._prepare_price_fetch_metadata(
+            target_tokens_df=target_tokens_df,
+            markets_df=markets_df,
+            events_df=events_df,
+            existing_latest_ts=existing_latest_ts,
+            now_ts=now_ts,
+        )
+        if metadata.empty:
+            self.metrics["skipped_price_assets"] = 0
+            self.metrics["skipped_existing_history_assets"] = 0
+            self.metrics["skipped_inactive_priced_assets"] = 0
+            return []
+
+        interval_s = self._interval_to_seconds(self.config.interval) or 3600
+        overlap_points = max(0, int(self.config.incremental_overlap_points))
+        overlap_s = overlap_points * interval_s
+
+        skipped_existing_history = 0
+        skipped_inactive_existing = 0
+        working = metadata.copy()
+
+        if bool(self.config.skip_inactive_priced_assets):
+            inactive_existing_mask = working["has_history"] & working["is_inactive"]
+            skipped_inactive_existing = int(inactive_existing_mask.sum())
+            if skipped_inactive_existing > 0:
+                working = working.loc[~inactive_existing_mask].copy()
+
+        if bool(self.config.incremental_prices) and incremental_mode == "skip":
+            history_mask = working["has_history"]
+            skipped_existing_history = int(history_mask.sum())
+            if skipped_existing_history > 0:
+                working = working.loc[~history_mask].copy()
+
+        if working.empty:
+            self.metrics["skipped_price_assets"] = skipped_existing_history + skipped_inactive_existing
+            self.metrics["skipped_existing_history_assets"] = skipped_existing_history
+            self.metrics["skipped_inactive_priced_assets"] = skipped_inactive_existing
+            return []
+
+        working["bucket"] = "new_active"
+        working.loc[working["is_inactive"], "bucket"] = "new_inactive"
+        working.loc[working["has_history"], "bucket"] = "existing"
+        working["fetch_start_ts"] = int(global_start_ts)
+        if bool(self.config.incremental_prices) and incremental_mode == "tail":
+            existing_mask = working["has_history"]
+            existing_latest = pd.to_numeric(working.loc[existing_mask, "latest_ts"], errors="coerce").fillna(global_start_ts)
+            working.loc[existing_mask, "fetch_start_ts"] = (
+                existing_latest.astype("int64") - overlap_s
+            ).clip(lower=int(global_start_ts))
+
+        existing_rows = working[working["bucket"] == "existing"].sort_values(["latest_ts", "asset_id"], kind="stable")
+        active_rows = self._order_price_fetch_rows(working[working["bucket"] == "new_active"])
+        inactive_rows = self._order_price_fetch_rows(working[working["bucket"] == "new_inactive"])
+        ordered = pd.concat([existing_rows, active_rows, inactive_rows], ignore_index=True)
+
+        self.metrics["fetch_plan_existing_assets"] = int(len(existing_rows))
+        self.metrics["fetch_plan_new_active_assets"] = int(len(active_rows))
+        self.metrics["fetch_plan_new_inactive_assets"] = int(len(inactive_rows))
+        self.metrics["skipped_existing_history_assets"] = int(skipped_existing_history)
+        self.metrics["skipped_inactive_priced_assets"] = int(skipped_inactive_existing)
+        self.metrics["skipped_price_assets"] = int(skipped_existing_history + skipped_inactive_existing)
+
+        LOGGER.info(
+            (
+                "Price fetch plan: total=%s existing=%s new_active=%s new_inactive=%s "
+                "skipped_existing=%s skipped_inactive_existing=%s incremental=%s mode=%s priority=%s overlap_points=%s"
+            ),
+            len(ordered),
+            len(existing_rows),
+            len(active_rows),
+            len(inactive_rows),
+            skipped_existing_history,
+            skipped_inactive_existing,
+            bool(self.config.incremental_prices),
+            incremental_mode,
+            self.config.fetch_priority_mode,
+            overlap_points,
+        )
+
+        tasks: list[PriceFetchTask] = []
+        for row in ordered.to_dict(orient="records"):
+            tasks.append(
+                PriceFetchTask(
+                    asset_id=str(row["asset_id"]),
+                    start_ts=int(row["fetch_start_ts"]),
+                    bucket=str(row["bucket"]),
+                    primary_tag=str(row.get("primary_tag", "unknown")),
+                )
+            )
+        return tasks
+
+    def _prepare_price_fetch_metadata(
+        self,
+        *,
+        target_tokens_df: pd.DataFrame,
+        markets_df: pd.DataFrame,
+        events_df: pd.DataFrame,
+        existing_latest_ts: dict[str, int],
+        now_ts: int,
+    ) -> pd.DataFrame:
+        metadata = target_tokens_df[["asset_id", "market_id"]].drop_duplicates().copy()
+        metadata["asset_id"] = metadata["asset_id"].astype(str)
+        metadata["market_id"] = metadata["market_id"].astype(str)
+
+        market_cols = [col for col in ["market_id", "event_id", "active", "closed", "resolved"] if col in markets_df.columns]
+        if market_cols:
+            market_meta = markets_df[market_cols].copy()
+            market_meta["market_id"] = market_meta["market_id"].astype(str)
+            metadata = metadata.merge(market_meta, on="market_id", how="left")
+
+        if not events_df.empty and "event_id" in events_df.columns and "event_id" in metadata.columns:
+            event_meta = events_df[["event_id"]].copy()
+            if "end_ts" in events_df.columns:
+                event_meta["end_ts"] = pd.to_numeric(events_df["end_ts"], errors="coerce")
+            else:
+                event_meta["end_ts"] = pd.NA
+            if "tags" in events_df.columns:
+                event_meta["primary_tag"] = events_df["tags"].apply(primary_tag_from_json)
+            else:
+                event_meta["primary_tag"] = "unknown"
+            metadata = metadata.merge(event_meta, on="event_id", how="left")
+        else:
+            metadata["end_ts"] = pd.NA
+            metadata["primary_tag"] = "unknown"
+
+        metadata["primary_tag"] = metadata["primary_tag"].fillna("unknown").astype(str).str.strip().replace("", "unknown")
+        metadata["latest_ts"] = metadata["asset_id"].map(existing_latest_ts)
+        metadata["latest_ts"] = pd.to_numeric(metadata["latest_ts"], errors="coerce")
+        metadata["has_history"] = metadata["latest_ts"].notna()
+
+        active_series = self._optional_bool_series(metadata, "active")
+        closed_series = self._optional_bool_series(metadata, "closed")
+        resolved_series = self._optional_bool_series(metadata, "resolved")
+        end_ts = pd.to_numeric(metadata.get("end_ts", pd.Series(index=metadata.index, dtype="float64")), errors="coerce")
+        end_ts = end_ts.reindex(metadata.index)
+        ended_series = end_ts.notna() & (end_ts < int(now_ts))
+        metadata["is_inactive"] = (
+            active_series.eq(False).fillna(False)
+            | closed_series.fillna(False)
+            | resolved_series.fillna(False)
+            | ended_series
+        )
+
+        tag_coverage = (
+            metadata.groupby("primary_tag", dropna=False)
+            .agg(tag_assets=("asset_id", "count"), tag_assets_with_history=("has_history", "sum"))
+            .reset_index()
+        )
+        tag_coverage["tag_coverage"] = tag_coverage["tag_assets_with_history"] / tag_coverage["tag_assets"].clip(lower=1)
+        metadata = metadata.merge(tag_coverage[["primary_tag", "tag_coverage"]], on="primary_tag", how="left")
+        metadata["tag_coverage"] = pd.to_numeric(metadata["tag_coverage"], errors="coerce").fillna(1.0)
+        return metadata
+
+    def _order_price_fetch_rows(self, rows: pd.DataFrame) -> pd.DataFrame:
+        if rows.empty:
+            return rows.copy()
+        priority_mode = str(getattr(self.config, "fetch_priority_mode", "history_first")).strip().lower()
+        working = rows.copy()
+        working["primary_tag"] = working["primary_tag"].fillna("unknown").astype(str)
+        working["tag_coverage"] = pd.to_numeric(working["tag_coverage"], errors="coerce").fillna(1.0)
+        if priority_mode == "category_round_robin":
+            return self._round_robin_by_tag(working)
+        return working.sort_values(["tag_coverage", "primary_tag", "asset_id"], kind="stable")
+
+    @staticmethod
+    def _round_robin_by_tag(rows: pd.DataFrame) -> pd.DataFrame:
+        if rows.empty:
+            return rows.copy()
+        working = rows.sort_values(["tag_coverage", "primary_tag", "asset_id"], kind="stable").copy()
+        tag_order = (
+            working.groupby("primary_tag", dropna=False)["tag_coverage"]
+            .min()
+            .sort_values(kind="stable")
+            .index.astype(str)
+            .tolist()
+        )
+        per_tag = {
+            tag: group.sort_values(["asset_id"], kind="stable").to_dict(orient="records")
+            for tag, group in working.groupby("primary_tag", dropna=False)
+        }
+        ordered_rows: list[dict[str, Any]] = []
+        while True:
+            progressed = False
+            for tag in tag_order:
+                bucket = per_tag.get(tag) or []
+                if not bucket:
+                    continue
+                ordered_rows.append(bucket.pop(0))
+                progressed = True
+            if not progressed:
+                break
+        return pd.DataFrame(ordered_rows, columns=working.columns)
+
+    @staticmethod
+    def _optional_bool_series(frame: pd.DataFrame, column: str) -> pd.Series:
+        if column not in frame.columns:
+            return pd.Series(pd.array([pd.NA] * len(frame), dtype="boolean"), index=frame.index)
+        return frame[column].astype("boolean")
 
     @staticmethod
     def _interval_to_seconds(interval: str) -> int | None:
@@ -928,6 +1144,9 @@ class PipelineRunner:
         return mapping.get(str(interval).strip().lower())
 
     def _log_history_cadence_sanity(self, history_df: pd.DataFrame) -> None:
+        self.metrics["cadence_checked_assets"] = 0
+        self.metrics["cadence_mismatch_assets"] = 0
+
         if history_df.empty:
             return
 
@@ -950,13 +1169,25 @@ class PipelineRunner:
         if cadence.empty:
             return
 
+        mismatch_mask = cadence["step_s"] < (expected_interval_s * 0.5)
+        mismatch_assets = int(mismatch_mask.sum())
+        self.metrics["cadence_checked_assets"] = int(len(cadence))
+        self.metrics["cadence_mismatch_assets"] = mismatch_assets
+
         median_step_s = float(cadence["step_s"].median())
-        if median_step_s < (expected_interval_s * 0.5):
+        if mismatch_assets > 0:
+            mismatch_ratio = float(mismatch_assets / max(1, len(cadence)))
             LOGGER.warning(
-                "Observed history cadence looks faster than requested interval: requested=%s (~%ss) median_observed_step=%.1fs",
+                (
+                    "Observed history cadence mismatch: requested=%s (~%ss) "
+                    "median_observed_step=%.1fs mismatched_assets=%s/%s (%.1f%%)"
+                ),
                 self.config.interval,
                 expected_interval_s,
                 median_step_s,
+                mismatch_assets,
+                int(len(cadence)),
+                mismatch_ratio * 100.0,
             )
 
     @staticmethod

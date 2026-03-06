@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Callable
 from typing import Any
 
 import numpy as np
@@ -23,19 +24,28 @@ class ResolutionConvergenceSignal(Signal):
         price_history: pd.Series,
         volume_history: pd.Series | None,
         as_of_ts: int,
+        record_debug: Callable[[str], None] | None = None,
     ) -> SignalOutput | None:
         current_price = _latest_price(price_history)
         if current_price is None:
+            if record_debug is not None:
+                record_debug("missing_price")
             return None
         if not (0.25 <= float(current_price) <= 0.75):
+            if record_debug is not None:
+                record_debug("price_not_midrange")
             return None
 
         days_to_resolution = features.get("days_to_resolution")
         try:
             dtr = float(days_to_resolution)
         except (TypeError, ValueError):
+            if record_debug is not None:
+                record_debug("missing_days_to_resolution")
             return None
         if not np.isfinite(dtr) or dtr < 0 or dtr > float(self.days_threshold):
+            if record_debug is not None:
+                record_debug("out_of_window")
             return None
 
         slope = features.get("slope")
