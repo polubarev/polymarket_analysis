@@ -21,7 +21,7 @@ class PipelineConfig:
     clob_rate_limit: int = 1000
     data_rate_limit: int = 200
     rate_window_s: int = 10
-    yes_only_binary: bool = True
+    yes_only_binary: bool = False
     fetch_trades_sample: int = 0
     cluster_k: int = 8
     gap_fill_limit: int = 6

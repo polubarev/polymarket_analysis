@@ -163,11 +163,11 @@ def _parse_active_signals(raw: str) -> list[str]:
 
 
 def _config_from_run_args(args: argparse.Namespace) -> PipelineConfig:
-    yes_only = True
-    if args.all_outcomes:
-        yes_only = False
-    elif args.yes_only_binary:
+    yes_only = False
+    if args.yes_only_binary:
         yes_only = True
+    elif args.all_outcomes:
+        yes_only = False
 
     return PipelineConfig(
         output_dir=Path(args.output_dir),

@@ -51,6 +51,8 @@ EXPECTED_NULL_COLS = {
     "return_30d",
     # partially expected with short history
     "return_1d", "return_7d", "zscore_7d", "rsi_14",
+    # pipeline_runs: columns added after initial runs — historical rows have nulls
+    "signals_expected", "pipeline_profile",
 }
 
 PK_MAP = {
@@ -407,7 +409,7 @@ def run_audit(prod_dir: Path):
         if "signals_generated" in pr.columns:
             signal_runs = pr.copy()
             if "signals_expected" in signal_runs.columns:
-                expected_mask = signal_runs["signals_expected"].fillna(False).astype(bool)
+                expected_mask = signal_runs["signals_expected"].fillna(False).infer_objects(copy=False).astype(bool)
                 signal_runs = signal_runs.loc[expected_mask].copy()
             if not signal_runs.empty and (signal_runs["signals_generated"].tail(10) == 0).all():
                 issues_warning.append("signals_generated=0 for last 10 signal-enabled runs — signal engine producing nothing")
