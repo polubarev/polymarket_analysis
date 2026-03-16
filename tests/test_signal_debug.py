@@ -10,9 +10,14 @@ from polymarket_pipeline.signals_runner import run_signal_generation
 
 class SignalDebugTests(unittest.TestCase):
     def test_signal_debug_tracks_missing_feature_reason(self) -> None:
+        """Test that debug tracking records why a signal didn't fire.
+
+        Uses resolution_convergence signal with mid-range price (0.5)
+        which should be rejected with 'price_not_extreme'.
+        """
         config = PipelineConfig(
             run_signals=True,
-            active_signals=["mean_reversion"],
+            active_signals=["convergence"],
             signal_debug=True,
             signal_debug_limit=2,
         )
@@ -20,9 +25,11 @@ class SignalDebugTests(unittest.TestCase):
             [
                 {
                     "asset_id": "asset-1",
-                    "zscore_7d": None,
-                    "days_to_resolution": 3.0,
+                    "days_to_resolution": 1.0,
                     "slope": 0.1,
+                    "avg_spread": 0.01,
+                    "avg_daily_volume": 1000.0,
+                    "num_points": 200,
                 }
             ]
         )
@@ -52,11 +59,11 @@ class SignalDebugTests(unittest.TestCase):
 
         self.assertTrue(signals_df.empty)
         self.assertIsNotNone(debug_payload)
-        mean_reversion = debug_payload["signals"]["mean_reversion"]
-        self.assertEqual(mean_reversion["considered"], 1)
-        self.assertEqual(mean_reversion["missing_zscore_7d"], 1)
-        self.assertEqual(mean_reversion["generated"], 0)
-        self.assertEqual(mean_reversion["samples"]["missing_zscore_7d"][0]["asset_id"], "asset-1")
+        convergence = debug_payload["signals"]["convergence"]
+        self.assertEqual(convergence["considered"], 1)
+        self.assertEqual(convergence["price_not_extreme"], 1)
+        self.assertEqual(convergence["generated"], 0)
+        self.assertEqual(convergence["samples"]["price_not_extreme"][0]["asset_id"], "asset-1")
 
 
 if __name__ == "__main__":
