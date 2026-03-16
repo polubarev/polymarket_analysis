@@ -45,8 +45,8 @@ EXPECTED_NULL_COLS = {
     "avg_spread", "avg_spread_pct", "spread_trend", "avg_depth",
     # needs --ingest-volume
     "avg_daily_volume", "volume_trend", "buy_sell_ratio", "volume_price_corr",
-    # needs --include-resolved
-    "resolution_outcome",
+    # needs --include-resolved (most markets are active/unresolved)
+    "resolution_outcome", "resolution_ts",
     # needs longer history (30 days)
     "return_30d",
     # partially expected with short history

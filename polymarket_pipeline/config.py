@@ -31,7 +31,7 @@ class PipelineConfig:
     quality_min_price_range: float = 0.02
     quality_min_liquidity: float = 0.0
     tag_rank_top_n: int = 10
-    price_fetch_workers: int = 16
+    price_fetch_workers: int = 5
     fetch_priority_mode: str = "history_first"
     incremental_prices: bool = True
     incremental_mode: str = "tail"
@@ -59,8 +59,10 @@ class PipelineConfig:
     signal_debug_limit: int = 20
     calibration_threshold: float = 0.15
     spike_zscore_threshold: float = 2.5
-    convergence_days_threshold: int = 7
+    convergence_days_threshold: int = 2
     breakout_lookback_days: int = 30
+    imbalance_ratio_threshold: float = 3.0
+    volume_surge_threshold: float = 2.0
 
     # Task 6: Backtesting
     run_backtest: bool = False

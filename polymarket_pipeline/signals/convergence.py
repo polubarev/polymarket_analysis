@@ -7,12 +7,21 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from . import Signal, SignalOutput, _latest_price
+from . import Signal, SignalOutput, _latest_price, _actual_spread, _calibrated_confidence
 
 
 @dataclass(slots=True)
 class ResolutionConvergenceSignal(Signal):
-    days_threshold: int = 7
+    """Late-stage convergence: bet on near-certain outcomes close to resolution.
+
+    Only fires when:
+    - Market is within 2 days of resolution
+    - Price already > 0.85 (buy → 1.0) or < 0.15 (sell → 0.0)
+    - Slope confirms the direction
+    - Spread is tight enough to trade
+    """
+
+    days_threshold: int = 2
     name: str = "resolution_convergence"
 
     def compute(
@@ -28,35 +37,67 @@ class ResolutionConvergenceSignal(Signal):
     ) -> SignalOutput | None:
         current_price = _latest_price(price_history)
         if current_price is None:
-            if record_debug is not None:
+            if record_debug:
                 record_debug("missing_price")
             return None
-        if not (0.25 <= float(current_price) <= 0.75):
-            if record_debug is not None:
-                record_debug("price_not_midrange")
+
+        # Must be near an extreme — high conviction already priced in
+        if not (current_price > 0.85 or current_price < 0.15):
+            if record_debug:
+                record_debug("price_not_extreme")
             return None
 
+        # Must be close to resolution
         days_to_resolution = features.get("days_to_resolution")
         try:
             dtr = float(days_to_resolution)
         except (TypeError, ValueError):
-            if record_debug is not None:
+            if record_debug:
                 record_debug("missing_days_to_resolution")
             return None
         if not np.isfinite(dtr) or dtr < 0 or dtr > float(self.days_threshold):
-            if record_debug is not None:
+            if record_debug:
                 record_debug("out_of_window")
             return None
 
+        # Slope must confirm direction
         slope = features.get("slope")
         try:
             slope_value = float(slope)
         except (TypeError, ValueError):
             slope_value = 0.0
-        direction = "buy" if slope_value >= 0 else "sell"
-        confidence = min(1.0, max(0.0, 1.0 - (dtr / max(1e-9, float(self.days_threshold)))))
+
+        if current_price > 0.85 and slope_value <= 0:
+            if record_debug:
+                record_debug("slope_contradicts_buy")
+            return None
+        if current_price < 0.15 and slope_value >= 0:
+            if record_debug:
+                record_debug("slope_contradicts_sell")
+            return None
+
+        # Spread must be tight
+        spread = _actual_spread(features)
+        if spread > 0.03:
+            if record_debug:
+                record_debug("spread_too_wide")
+            return None
+
+        direction = "buy" if current_price > 0.85 else "sell"
         target_price = 1.0 if direction == "buy" else 0.0
-        edge = abs(target_price - float(current_price))
+
+        # Signal strength: how extreme the price is × how close to resolution
+        price_extremity = abs(current_price - 0.5) / 0.5  # 0.7 at 0.85, 1.0 at edges
+        time_urgency = 1.0 - (dtr / max(1e-9, float(self.days_threshold)))
+        signal_strength = price_extremity * time_urgency
+
+        confidence = _calibrated_confidence(signal_strength, features)
+        edge = abs(target_price - current_price) - spread
+        if edge <= 0:
+            if record_debug:
+                record_debug("no_edge_after_spread")
+            return None
+
         return SignalOutput(
             direction=direction,
             confidence=confidence,
@@ -66,10 +107,11 @@ class ResolutionConvergenceSignal(Signal):
             metadata={
                 "days_to_resolution": dtr,
                 "slope": slope_value,
-                "threshold_days": int(self.days_threshold),
+                "spread": spread,
+                "price_extremity": round(price_extremity, 4),
             },
         )
 
     def explain(self, output: SignalOutput) -> str:
         dtr = output.metadata.get("days_to_resolution")
-        return f"Market is {dtr:.1f} days from resolution; convergence signal favors {output.direction}."
+        return f"Market {dtr:.1f}d from resolution, price near {'1.0' if output.direction == 'buy' else '0.0'}."

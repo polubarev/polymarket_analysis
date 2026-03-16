@@ -1,91 +1,92 @@
-# Pipeline Status & Next Steps
+# Pipeline Status — PAUSED
 
-**Last updated: 2026-03-08**
+**Last updated: 2026-03-15**
+**Status: PAUSED / ARCHIVED** — no active development
 
-## Recent Session Summary (2026-03-08)
+## Why Paused
 
-### What was done
-1. **Ran full data quality audit** (`python scripts/dq_check.py --dir data/prod`)
-   - 18 passes, 0 criticals (after fixes), 23 warnings
-   - Verdict: READY FOR ANALYSIS
+After 3 rounds of signal development and rigorous empirical testing on 991K price observations across 1,067 tradeable assets, we conclusively proved that **statistical price-pattern signals cannot beat the bid-ask spread on Polymarket**.
 
-2. **Fixed false-alarm criticals in DQ check**
-   - `pipeline_runs.parquet` had 57% nulls in `signals_expected` and `pipeline_profile` — these were historical rows from before those columns existed
-   - Backfilled 73 old rows with defaults (`False` / `"ingest-hourly"`)
-   - Added these columns to `EXPECTED_NULL_COLS` in `dq_check.py`
-   - Fixed FutureWarning on `fillna` downcasting
+| Hypothesis | Result | Mean Forward Move | Net After Spread |
+|---|---|---|---|
+| Price > 0.85 → converges to 1.0 | No edge | +0.03% at 24h | **-3.0%** |
+| Price < 0.15 → converges to 0.0 | No edge | +0.04% wrong dir | **-3.0%** |
+| Momentum (big move continues) | Negative edge | -1.0% at 24h | **-4.0%** |
+| Mean reversion | Barely better than random | +1.0% at 24h | **-2.0%** |
 
-3. **Enabled full pipeline features across all Cloud Run jobs**
-   - `yes_only_binary` → `False` (fetch both Yes AND No tokens; expect coverage ~59% → ~95%)
-   - Hourly job: added `--snapshot-orderbook` and `--ingest-volume`
-   - Nightly job: added signals, backtest, candidates, resolutions, orderbook, volume
-   - Research job: added `INCLUDE_RESOLVED=true`
-   - Added `INCLUDE_RESOLVED` env var support to `cloud_run_entrypoint.sh`
+Even on the 88 most liquid assets (spread ≤1%, volume ≥$500/day): best case is +0.5% at 72h, still -0.5% net after spread.
 
-4. **Deployed to Cloud Run** — all 3 jobs + schedulers updated, image rebuilt
+**Root cause**: Polymarket is efficient. Prices are event-driven (news), not pattern-driven. Statistical edges are ~0% before costs. The 1-3% spread kills everything.
 
-### Commit
-`26a8dec` — "Enable full pipeline: all outcomes, orderbook, volume, backtest" (merged to main)
+## What Works & What Doesn't
 
----
+### ✅ Working well
+- Data pipeline (ingestion, normalization, storage)
+- Feature engineering (30+ features per asset)
+- Orderbook + volume bar collection
+- MTM backtesting engine
+- Cloud Run deployment (3 scheduled jobs)
+- GCS sync for data persistence
 
-## Current Data Snapshot (data/prod, 2026-03-08)
+### ❌ Not viable
+- Mean reversion signals (deleted)
+- Convergence signals (no edge after spread)
+- Momentum signals (prices actually revert)
+- Orderbook imbalance signals (data too sparse)
+- Any market-order strategy on Polymarket
 
-| File | Rows | Notes |
-|------|------|-------|
-| events | 943 | |
-| markets | 5,672 | |
-| tokens | 11,344 | |
-| price_history | 1,915,514 | 385 MB, 35.1 days |
-| features | 3,351 | |
-| clusters | 3,124 | 8 clusters |
-| market_quality | 5,672 | 55.1% quality pass |
-| pipeline_runs | 129 | all HEALTHY |
-| signals | 474 | |
-| backtest_results | 0 | was disabled, now enabled |
-| trade_candidates | 20 | |
-| orderbook_snapshots | 5,672 | |
-| volume_bars | 39,436 | |
+## To Resume: What Would Need to Change
 
-Coverage funnel: Events 943 → Markets 5,672 → Tokens 11,344 → w/price 3,364 (29.7% of all tokens) → Features 3,351 → Clustered 3,124
+Only resume if you have one of:
+1. **Limit order execution** — CLOB API for placing limit orders at mid-price (0% spread). The convergence signal has +0.5% raw edge that becomes profitable at zero spread.
+2. **Informational edge** — news/event data source that lets you predict resolution outcomes before the market prices them.
+3. **A specific thesis** — don't spend time unless you have a concrete idea to test.
 
-Pipeline runs stable: 10 consecutive HEALTHY runs, ~860s each, hourly cadence.
+## Before Resuming: Quick Start
 
----
+```bash
+# Read this file first
+# Activate venv
+source .venv/Scripts/activate
 
-## Next Steps (Prioritized)
+# Sync latest data from GCS
+source .env && python -m polymarket_pipeline.gcs_sync --local-dir data/prod --gcs-uri "$GCS_OUTPUT_URI" --mode download
 
-### Immediate — verify deploy worked (next session)
-- [ ] Wait for 1-2 hourly runs after deploy, then run DQ check again
-- [ ] Verify `price_coverage_pct` jumped from 59% toward 95%
-- [ ] Verify orderbook/volume feature nulls are filling in
-- [ ] After nightly run: check `backtest_results.parquet` has rows
-- [ ] After nightly run: check `resolutions.parquet` appeared
+# Run DQ check
+PYTHONIOENCODING=utf-8 python scripts/dq_check.py --dir data/prod
 
-### Short-term — data quality improvements
-- [ ] Fix `markets.liquidity` dtype (currently `str`, should be `float`) in `normalize.py`
-- [ ] Fix `pct_lifetime_elapsed` computation bug (values >1 and <0 for resolved markets)
-- [ ] Add logging to `client.py` for HTTP 400/404 failures (currently silently returns `[]`)
-- [ ] Investigate which tokens still fail API calls after all-outcomes enabled
+# Run hypothesis test (validates whether anything changed)
+PYTHONIOENCODING=utf-8 python scripts/hypothesis_test.py
+```
 
-### Medium-term — analysis & strategy
-- [ ] Analyze backtest results once populated — are signals profitable?
-- [ ] Review signal quality: 474 signals generated, what's the hit rate?
-- [ ] Evaluate trade candidates quality (currently 20)
-- [ ] Consider tuning cluster_k (currently 8, silhouette ~0.2)
-- [ ] Consider enabling `--detect-relationships` for cross-market correlation
+## Cloud Run: Consider Stopping
 
-### Long-term — infrastructure
-- [ ] Monitor Cloud Run costs after enabling orderbook + volume (more API calls)
-- [ ] Consider adding alerting on pipeline failures (currently just health check JSON)
-- [ ] Add CI/CD pipeline for automated testing before deploy
-- [ ] Consider Kelly sizing mode instead of flat for position sizing
+The pipeline is still running on Cloud Run (daily + weekly schedules), costing money. If pausing indefinitely:
+```powershell
+# From PowerShell (not WSL):
+gcloud scheduler jobs pause polymarket-hourly --location us-central1
+gcloud scheduler jobs pause polymarket-nightly --location us-central1
+gcloud scheduler jobs pause polymarket-daily-research --location us-central1
+```
 
----
+## Data Snapshot (as of 2026-03-14)
 
-## Known Issues
-1. **Orderbook/volume nulls (20-35%)** — now being filled by hourly runs, but historical data won't have it
-2. **`spread_trend` always null** — needs multiple orderbook snapshots over time (will accumulate)
-3. **`volume_price_corr` ~50% null** — needs both volume AND sufficient price history
-4. **`return_30d` ~61% null** — many assets younger than 30 days
-5. **`gcloud` not in WSL PATH** — deploy must be run from PowerShell/CMD
+| File | Rows |
+|------|------|
+| events | 944 |
+| markets | 5,679 |
+| tokens | 11,358 |
+| price_history | 3,923,900 |
+| features | 6,701 |
+| orderbook_snapshots | 5,672 |
+| volume_bars | 63,748 |
+| resolutions | 7 |
+
+## Project Timeline
+- **Feb 2026**: Pipeline built, deployed to Cloud Run
+- **Mar 8**: Full feature deploy (all outcomes, orderbook, volume, backtest)
+- **Mar 14**: Signal analysis begins, MTM backtest built, all 3 signals proven unprofitable
+- **Mar 15**: Empirical hypothesis test on raw data confirms no statistical edge exists. **Project paused.**
+
+## Worktree Note
+Signal rework code lives in worktree `bold-shirley` (not merged to main). The code is correct but the strategy doesn't work, so it's not worth merging.

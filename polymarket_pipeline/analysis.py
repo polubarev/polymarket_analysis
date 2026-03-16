@@ -35,6 +35,8 @@ FEATURE_COLUMNS = [
     "avg_spread_pct",
     "spread_trend",
     "avg_depth",
+    "avg_bid_depth",
+    "avg_ask_depth",
     "avg_daily_volume",
     "volume_trend",
     "buy_sell_ratio",
@@ -70,6 +72,8 @@ FEATURE_METADATA: list[dict[str, Any]] = [
     {"name": "avg_spread_pct", "type": "microstructure", "window": "recent snapshots", "description": "Mean spread / mid"},
     {"name": "spread_trend", "type": "microstructure", "window": "recent snapshots", "description": "Slope of spread"},
     {"name": "avg_depth", "type": "microstructure", "window": "recent snapshots", "description": "Average bid/ask depth at 5%"},
+    {"name": "avg_bid_depth", "type": "microstructure", "window": "recent snapshots", "description": "Average bid depth at 5%"},
+    {"name": "avg_ask_depth", "type": "microstructure", "window": "recent snapshots", "description": "Average ask depth at 5%"},
     {"name": "avg_daily_volume", "type": "volume", "window": "lookback", "description": "Mean daily traded volume"},
     {"name": "volume_trend", "type": "volume", "window": "lookback", "description": "Trend in daily volume"},
     {"name": "buy_sell_ratio", "type": "volume", "window": "lookback", "description": "Total buy volume / sell volume"},
@@ -259,6 +263,8 @@ def compute_asset_features(
         avg_spread_pct = np.nan
         spread_trend = np.nan
         avg_depth = np.nan
+        avg_bid_depth = np.nan
+        avg_ask_depth = np.nan
         if ob_group is not None and not ob_group.empty:
             spreads = pd.to_numeric(ob_group.get("spread"), errors="coerce").dropna()
             spread_pct = pd.to_numeric(ob_group.get("spread_pct"), errors="coerce").dropna()
@@ -269,11 +275,13 @@ def compute_asset_features(
             if not spread_pct.empty:
                 avg_spread_pct = float(spread_pct.mean())
             if "bid_depth_5pct" in ob_group.columns and "ask_depth_5pct" in ob_group.columns:
-                depth_series = (
-                    pd.to_numeric(ob_group["bid_depth_5pct"], errors="coerce")
-                    + pd.to_numeric(ob_group["ask_depth_5pct"], errors="coerce")
-                ) / 2.0
-                depth_series = depth_series.dropna()
+                bid_depth_s = pd.to_numeric(ob_group["bid_depth_5pct"], errors="coerce").dropna()
+                ask_depth_s = pd.to_numeric(ob_group["ask_depth_5pct"], errors="coerce").dropna()
+                if not bid_depth_s.empty:
+                    avg_bid_depth = float(bid_depth_s.mean())
+                if not ask_depth_s.empty:
+                    avg_ask_depth = float(ask_depth_s.mean())
+                depth_series = ((bid_depth_s.reindex(ob_group.index).fillna(0) + ask_depth_s.reindex(ob_group.index).fillna(0)) / 2.0).dropna()
                 if not depth_series.empty:
                     avg_depth = float(depth_series.mean())
 
@@ -342,6 +350,8 @@ def compute_asset_features(
                 "avg_spread_pct": avg_spread_pct,
                 "spread_trend": spread_trend,
                 "avg_depth": avg_depth,
+                "avg_bid_depth": avg_bid_depth,
+                "avg_ask_depth": avg_ask_depth,
                 "avg_daily_volume": avg_daily_volume,
                 "volume_trend": volume_trend,
                 "buy_sell_ratio": buy_sell_ratio,

@@ -223,6 +223,16 @@ def run_signal_generation(
             "primary_tag": str(row.get("primary_tag", "unknown")),
         }
 
+        # Spread pre-filter: skip assets with wide spreads (no tradeable edge)
+        try:
+            _avg_spread = float(row.get("avg_spread", float("nan")))
+        except (TypeError, ValueError):
+            _avg_spread = float("nan")
+        if np.isfinite(_avg_spread) and _avg_spread > 0.05:
+            for signal_name in active_names:
+                debug_tracker.bump(signal_name, "spread_too_wide", sample=sample)
+            continue
+
         for signal_name in active_names:
             debug_tracker.bump(signal_name, "considered", sample=sample)
             if price_series is None or price_series.empty:
