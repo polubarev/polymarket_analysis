@@ -1,13 +1,13 @@
 {
-  "updated_at": "2026-03-08T18:13:29.994155+00:00",
+  "updated_at": "2026-03-14T09:28:44.796842+00:00",
   "row_counts": {
-    "events": 943,
-    "markets": 5672,
-    "tokens": 11344,
-    "price_history": 1915514,
-    "features": 3351,
-    "clusters": 3124,
-    "market_quality": 5672,
-    "pipeline_runs": 129
+    "events": 944,
+    "markets": 5679,
+    "tokens": 11358,
+    "price_history": 3923900,
+    "features": 6701,
+    "clusters": 6136,
+    "market_quality": 11358,
+    "pipeline_runs": 185
   }
 }

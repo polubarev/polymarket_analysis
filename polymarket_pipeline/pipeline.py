@@ -43,6 +43,10 @@ class PriceFetchTask:
     primary_tag: str
 
 
+class PipelineInputError(RuntimeError):
+    pass
+
+
 class PipelineRunner:
     def __init__(self, config: PipelineConfig) -> None:
         self.config = config
@@ -136,6 +140,140 @@ class PipelineRunner:
         if self.config.fetch_trades_sample > 0:
             self._fetch_trades_sample(clients, markets_df)
 
+        outputs = self._run_analysis_outputs(
+            started_at=started_at,
+            outputs=outputs,
+            events_df=events_df,
+            markets_df=markets_df,
+            tokens_df=tokens_df,
+            target_tokens_df=target_tokens_df,
+            price_history_df=price_history_df,
+            orderbook_df=orderbook_df,
+            volume_bars_df=volume_bars_df,
+            resolutions_df=resolutions_df,
+            include_resolved_in_health=bool(self.config.include_resolved),
+        )
+
+        LOGGER.info(
+            "Pipeline done. requests=%s retries=%s empty_histories=%s price_history_errors=%s skipped_price_assets=%s",
+            self.metrics.get("requests", 0),
+            self.metrics.get("retries", 0),
+            self.metrics.get("empty_histories", 0),
+            self.metrics.get("price_history_errors", 0),
+            self.metrics.get("skipped_price_assets", 0),
+        )
+        return outputs
+
+    def run_analysis_only(self) -> dict[str, Path]:
+        started_at = time.time()
+        self.config.ensure_dirs()
+        output_dir = self.config.output_dir
+        required_inputs = {
+            "events": output_dir / "events.parquet",
+            "markets": output_dir / "markets.parquet",
+            "tokens": output_dir / "tokens.parquet",
+            "price_history": output_dir / "price_history.parquet",
+        }
+        missing = [path.name for path in required_inputs.values() if not path.exists()]
+        if missing:
+            raise PipelineInputError(
+                f"Analyze mode requires existing base parquet inputs in {output_dir}: {', '.join(sorted(missing))}"
+            )
+
+        events_df = pd.read_parquet(required_inputs["events"])
+        markets_df = pd.read_parquet(required_inputs["markets"])
+        tokens_df = pd.read_parquet(required_inputs["tokens"])
+        price_history_df = pd.read_parquet(required_inputs["price_history"])
+        target_tokens_df = select_price_tokens(tokens_df, markets_df, yes_only_binary=self.config.yes_only_binary)
+
+        resolutions_path = output_dir / "resolutions.parquet"
+        volume_bars_path = output_dir / "volume_bars.parquet"
+        orderbook_path = output_dir / "orderbook_snapshots.parquet"
+        resolutions_df = read_parquet_if_exists(resolutions_path)
+        volume_bars_df = read_parquet_if_exists(volume_bars_path)
+        diagnostics = {
+            "mode": "analysis_only",
+            "required_inputs": {name: True for name in required_inputs},
+            "optional_inputs": {
+                "resolutions_available": bool(resolutions_path.exists() and not resolutions_df.empty),
+                "volume_bars_available": bool(volume_bars_path.exists() and not volume_bars_df.empty),
+                "orderbook_snapshots_ignored": True,
+                "orderbook_file_present": bool(orderbook_path.exists()),
+            },
+        }
+
+        outputs = self._run_analysis_outputs(
+            started_at=started_at,
+            outputs={},
+            events_df=events_df,
+            markets_df=markets_df,
+            tokens_df=tokens_df,
+            target_tokens_df=target_tokens_df,
+            price_history_df=price_history_df,
+            orderbook_df=pd.DataFrame(),
+            volume_bars_df=volume_bars_df,
+            resolutions_df=resolutions_df,
+            include_resolved_in_health=bool(not resolutions_df.empty),
+            diagnostics=diagnostics,
+        )
+
+        LOGGER.info(
+            "Analysis-only pipeline done. volume_bars=%s resolutions=%s orderbook_file_present=%s",
+            diagnostics["optional_inputs"]["volume_bars_available"],
+            diagnostics["optional_inputs"]["resolutions_available"],
+            diagnostics["optional_inputs"]["orderbook_file_present"],
+        )
+        return outputs
+
+    def run_resolutions_only(self) -> dict[str, Path]:
+        self.config.ensure_dirs()
+        clients = self._build_clients()
+        outputs: dict[str, Path] = {}
+
+        resolved_events = self._discover_resolved_events(clients, lookback_days=self.config.resolved_lookback_days)
+        raw_path = self.config.raw_dir / f"resolved_events_{datetime.now(timezone.utc):%Y%m%d}.jsonl"
+        write_jsonl(raw_path, resolved_events, mode="w")
+        outputs["raw_resolved_events"] = raw_path
+
+        events_new, markets_new, tokens_new = extract_tables(resolved_events)
+        events_path = self.config.output_dir / "events.parquet"
+        markets_path = self.config.output_dir / "markets.parquet"
+        tokens_path = self.config.output_dir / "tokens.parquet"
+        events_df = upsert_parquet(events_path, events_new, dedupe_keys=["event_id"], sort_keys=["event_id"])
+        markets_df = upsert_parquet(markets_path, markets_new, dedupe_keys=["market_id"], sort_keys=["market_id"])
+        tokens_df = upsert_parquet(tokens_path, tokens_new, dedupe_keys=["market_id", "asset_id"], sort_keys=["market_id", "asset_id"])
+
+        price_history_df = read_parquet_if_exists(self.config.output_dir / "price_history.parquet")
+        resolutions_df = self._ingest_resolutions(
+            resolved_events=resolved_events,
+            markets_df=markets_df,
+            tokens_df=tokens_df,
+            price_history_df=price_history_df,
+            markets_path=markets_path,
+        )
+        outputs["events"] = events_path
+        outputs["markets"] = markets_path
+        outputs["tokens"] = tokens_path
+        if not resolutions_df.empty:
+            outputs["resolutions"] = self.config.output_dir / "resolutions.parquet"
+        return outputs
+
+    def _run_analysis_outputs(
+        self,
+        *,
+        started_at: float,
+        outputs: dict[str, Path],
+        events_df: pd.DataFrame,
+        markets_df: pd.DataFrame,
+        tokens_df: pd.DataFrame,
+        target_tokens_df: pd.DataFrame,
+        price_history_df: pd.DataFrame,
+        orderbook_df: pd.DataFrame,
+        volume_bars_df: pd.DataFrame,
+        resolutions_df: pd.DataFrame,
+        include_resolved_in_health: bool,
+        diagnostics: dict[str, Any] | None = None,
+    ) -> dict[str, Path]:
         (
             report_path,
             clusters_path,
@@ -185,6 +323,8 @@ class PipelineRunner:
                 volume_bars_df=volume_bars_df,
                 resolutions_df=resolutions_df,
             )
+            if diagnostics is not None and signal_debug_payload is not None:
+                self._attach_diagnostics(signal_debug_payload, diagnostics)
             signals_path = self.config.output_dir / "signals.parquet"
             signals_df = upsert_parquet(
                 signals_path,
@@ -265,57 +405,28 @@ class PipelineRunner:
             events_count=int(len(events_df)),
             markets_count=int(len(markets_df)),
             signals_generated=int(len(signals_df)),
-            include_resolved=bool(self.config.include_resolved),
+            include_resolved=bool(include_resolved_in_health),
         )
+        if diagnostics is not None:
+            self._attach_diagnostics(health_payload, diagnostics)
         health_path = self.config.analysis_dir / "health_check.json"
         with health_path.open("w", encoding="utf-8") as handle:
             json.dump(health_payload, handle, indent=2, ensure_ascii=True)
         append_pipeline_run(self.config.output_dir / "pipeline_runs.parquet", run_row)
         outputs["health_check"] = health_path
         outputs["pipeline_runs"] = self.config.output_dir / "pipeline_runs.parquet"
-
-        LOGGER.info(
-            "Pipeline done. requests=%s retries=%s empty_histories=%s price_history_errors=%s skipped_price_assets=%s",
-            self.metrics.get("requests", 0),
-            self.metrics.get("retries", 0),
-            self.metrics.get("empty_histories", 0),
-            self.metrics.get("price_history_errors", 0),
-            self.metrics.get("skipped_price_assets", 0),
-        )
         return outputs
 
-    def run_resolutions_only(self) -> dict[str, Path]:
-        self.config.ensure_dirs()
-        clients = self._build_clients()
-        outputs: dict[str, Path] = {}
-
-        resolved_events = self._discover_resolved_events(clients, lookback_days=self.config.resolved_lookback_days)
-        raw_path = self.config.raw_dir / f"resolved_events_{datetime.now(timezone.utc):%Y%m%d}.jsonl"
-        write_jsonl(raw_path, resolved_events, mode="w")
-        outputs["raw_resolved_events"] = raw_path
-
-        events_new, markets_new, tokens_new = extract_tables(resolved_events)
-        events_path = self.config.output_dir / "events.parquet"
-        markets_path = self.config.output_dir / "markets.parquet"
-        tokens_path = self.config.output_dir / "tokens.parquet"
-        events_df = upsert_parquet(events_path, events_new, dedupe_keys=["event_id"], sort_keys=["event_id"])
-        markets_df = upsert_parquet(markets_path, markets_new, dedupe_keys=["market_id"], sort_keys=["market_id"])
-        tokens_df = upsert_parquet(tokens_path, tokens_new, dedupe_keys=["market_id", "asset_id"], sort_keys=["market_id", "asset_id"])
-
-        price_history_df = read_parquet_if_exists(self.config.output_dir / "price_history.parquet")
-        resolutions_df = self._ingest_resolutions(
-            resolved_events=resolved_events,
-            markets_df=markets_df,
-            tokens_df=tokens_df,
-            price_history_df=price_history_df,
-            markets_path=markets_path,
-        )
-        outputs["events"] = events_path
-        outputs["markets"] = markets_path
-        outputs["tokens"] = tokens_path
-        if not resolutions_df.empty:
-            outputs["resolutions"] = self.config.output_dir / "resolutions.parquet"
-        return outputs
+    def _attach_diagnostics(self, payload: dict[str, Any], diagnostics: dict[str, Any]) -> None:
+        payload["input_sources"] = diagnostics
+        optional_inputs = diagnostics.get("optional_inputs", {})
+        warnings = list(payload.get("warnings", []))
+        if not optional_inputs.get("resolutions_available", True):
+            warnings.append("resolutions.parquet missing or empty; continuing without resolution data.")
+        if not optional_inputs.get("volume_bars_available", True):
+            warnings.append("volume_bars.parquet missing or empty; continuing without volume data.")
+        if warnings:
+            payload["warnings"] = list(dict.fromkeys(warnings))
 
     def _build_clients(self) -> PolymarketClients:
         return PolymarketClients(

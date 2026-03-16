@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import unittest
+from pathlib import Path
+from unittest.mock import patch
 
 import pandas as pd
 
-from polymarket_pipeline.cli import _build_run_parser, _config_from_run_args
+from polymarket_pipeline.cli import _build_run_parser, _config_from_run_args, main
 from polymarket_pipeline.config import PipelineConfig
+from polymarket_pipeline.pipeline import PipelineInputError
 from polymarket_pipeline.pipeline import PipelineRunner
 
 
@@ -35,6 +38,44 @@ class CliConfigTests(unittest.TestCase):
         self.assertFalse(config.skip_inactive_priced_assets)
         self.assertTrue(config.signal_debug)
         self.assertEqual(config.signal_debug_limit, 7)
+
+    def test_analyze_command_reuses_common_flags_and_routes_to_analysis_only(self) -> None:
+        with (
+            patch("polymarket_pipeline.cli.sys.argv", [
+                "polymarket-pipeline",
+                "analyze",
+                "--output-dir",
+                "data/dev",
+                "--pipeline-profile",
+                "research-weekly",
+                "--no-incremental-prices",
+                "--ingest-volume",
+                "--signal-debug",
+            ]),
+            patch("polymarket_pipeline.cli.PipelineRunner") as runner_cls,
+        ):
+            runner_cls.return_value.run_analysis_only.return_value = {"report": Path("data/dev/analysis/report.json")}
+
+            main()
+
+        config = runner_cls.call_args.args[0]
+        self.assertEqual(config.output_dir, Path("data/dev"))
+        self.assertEqual(config.pipeline_profile, "research-weekly")
+        self.assertFalse(config.incremental_prices)
+        self.assertTrue(config.ingest_volume)
+        self.assertTrue(config.signal_debug)
+        runner_cls.return_value.run_analysis_only.assert_called_once()
+        runner_cls.return_value.run.assert_not_called()
+
+    def test_analyze_command_exits_cleanly_on_missing_inputs(self) -> None:
+        with (
+            patch("polymarket_pipeline.cli.sys.argv", ["polymarket-pipeline", "analyze"]),
+            patch("polymarket_pipeline.cli.PipelineRunner") as runner_cls,
+        ):
+            runner_cls.return_value.run_analysis_only.side_effect = PipelineInputError("missing parquet inputs")
+
+            with self.assertRaisesRegex(SystemExit, "missing parquet inputs"):
+                main()
 
 
 class FetchPlanTests(unittest.TestCase):

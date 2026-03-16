@@ -14,6 +14,7 @@ if [[ -f "${ENV_FILE}" ]]; then
 fi
 
 OUTPUT_DIR="${OUTPUT_DIR:-/tmp/polymarket-data}"
+PIPELINE_COMMAND="${PIPELINE_COMMAND:-run}"
 PIPELINE_PROFILE="${PIPELINE_PROFILE:-default}"
 MAX_EVENTS="${MAX_EVENTS:-300}"
 WINDOW_DAYS="${WINDOW_DAYS:-30}"
@@ -128,7 +129,7 @@ if [[ -n "${GCS_OUTPUT_URI:-}" ]]; then
 fi
 
 echo "Running pipeline with output dir: ${OUTPUT_DIR}"
-polymarket-pipeline "${args[@]}"
+polymarket-pipeline "${PIPELINE_COMMAND}" "${args[@]}"
 
 if [[ -n "${GCS_OUTPUT_URI:-}" ]]; then
   echo "Uploading output to ${GCS_OUTPUT_URI}"

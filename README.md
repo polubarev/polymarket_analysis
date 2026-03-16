@@ -44,7 +44,7 @@ polymarket-pipeline \
 
 ## Phase 2 Strategy Mode
 
-Run the full research pipeline (resolved ingestion, optional orderbook/volume, signals, backtest, candidates):
+Run the full network-backed research pipeline (resolved ingestion, optional orderbook/volume, signals, backtest, candidates):
 
 ```bash
 polymarket-pipeline \
@@ -67,6 +67,20 @@ Resolved-only backfill command:
 
 ```bash
 polymarket-pipeline resolve --output-dir data/dev --lookback-days 365
+```
+
+Stored-parquet analysis-only refresh:
+
+```bash
+polymarket-pipeline analyze \
+  --output-dir data/dev \
+  --pipeline-profile research-weekly \
+  --yes-only-binary \
+  --include-resolved \
+  --run-signals \
+  --backtest \
+  --generate-candidates \
+  --signal-debug
 ```
 
 Optional trades validation sample:
@@ -193,10 +207,12 @@ Deployable Cloud Run Jobs setup is included:
 
 This gives you:
 
-- hourly incremental ingestion (`tail` mode)
-- nightly reconciliation (`--no-incremental-prices`)
-- daily research generation (`--snapshot-orderbook --ingest-volume --run-signals --backtest --generate-candidates`)
+- daily ingest at `10 3 * * *` UTC (`ingest-daily`)
+- weekly reconcile at `25 3 * * 6` UTC (`reconcile-weekly`, `--no-incremental-prices`, includes resolved)
+- weekly research at `30 5 * * 6` UTC (`research-weekly`, analysis-only from stored parquet data)
 - persistence to GCS via `GCS_OUTPUT_URI`
+
+In budget mode the automated dataset stays focused on prices, resolutions, and volume. Orderbook snapshots are disabled in the scheduled jobs, and `polymarket-pipeline analyze` intentionally ignores any stored `orderbook_snapshots.parquet`.
 
 Quick setup with `.env`:
 

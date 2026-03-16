@@ -6,7 +6,7 @@ import sys
 from pathlib import Path
 
 from .config import PipelineConfig
-from .pipeline import PipelineRunner
+from .pipeline import PipelineInputError, PipelineRunner
 
 
 def _add_common_pipeline_flags(parser: argparse.ArgumentParser) -> None:
@@ -252,21 +252,35 @@ def _config_from_resolve_args(args: argparse.Namespace) -> PipelineConfig:
 def main() -> None:
     argv = sys.argv[1:]
     command = "run"
-    if argv and not argv[0].startswith("-") and argv[0] in {"run", "resolve"}:
+    if argv and not argv[0].startswith("-") and argv[0] in {"run", "resolve", "analyze"}:
         command = argv[0]
         argv = argv[1:]
 
     parser = _build_resolve_parser() if command == "resolve" else _build_run_parser()
-    args = parser.parse_args(argv)
+    if command == "resolve":
+        args, ignored_args = parser.parse_known_args(argv)
+    else:
+        args = parser.parse_args(argv)
+        ignored_args = []
 
     logging.basicConfig(
         level=getattr(logging, str(args.log_level).upper(), logging.INFO),
         format="%(asctime)s %(levelname)s %(name)s - %(message)s",
     )
+    if ignored_args:
+        logging.info("Ignoring extra resolve args: %s", ignored_args)
 
     config = _config_from_resolve_args(args) if command == "resolve" else _config_from_run_args(args)
     runner = PipelineRunner(config)
-    outputs = runner.run_resolutions_only() if command == "resolve" else runner.run()
+    try:
+        if command == "resolve":
+            outputs = runner.run_resolutions_only()
+        elif command == "analyze":
+            outputs = runner.run_analysis_only()
+        else:
+            outputs = runner.run()
+    except PipelineInputError as exc:
+        raise SystemExit(str(exc)) from exc
 
     for key, value in outputs.items():
         logging.info("%s: %s", key, value)
